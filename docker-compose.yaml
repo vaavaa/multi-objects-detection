@@ -1,0 +1,88 @@
+# OpenWebUI + Ollama (GPU, локальные tools/functions)
+# Требуется: NVIDIA Container Toolkit (nvidia-ctk) для GPU
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    volumes:
+      - ollama:/root/.ollama
+      - ./ollama-images:/root/ollama-images  # загрузка картинок для анализа vision-моделями
+    ports:
+      - 127.0.0.1:11434:11434  # только localhost, если нужен доступ с хоста — уберите 127.0.0.1
+    pull_policy: if_not_present
+    tty: true
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    volumes:
+      - open-webui:/app/backend/data
+      # Вариант: данные на хосте (tools/functions правятся локально). Закомментируйте строку выше
+      # и раскомментируйте следующую, создайте папку: mkdir -p ./local-openwebui-data
+      # - ./local-openwebui-data:/app/backend/data
+    ports:
+      - 3000:8080
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      # - WEBUI_SECRET_KEY=your_secret_key  # Раскомментируйте и задайте ключ для продакшена
+      # Подключение tool time-ui (OpenAPI) — автоматически подхватывается в Settings > Connections
+      - 'TOOL_SERVER_CONNECTIONS=[{"type":"openapi","url":"http://time-ui:8000","spec_type":"url","spec":"","path":"openapi.json","auth_type":"none","key":"","config":{"enable":true},"info":{"id":"time-ui","name":"Time Tool","description":"Secure Time Utilities API: UTC/local time, formatting, timezone conversion."}}]'
+    # host.docker.internal — доступ к localhost хоста (tool-серверы, API, функции на хосте)
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      - ollama
+      - time-ui
+    pull_policy: if_not_present
+    restart: unless-stopped
+
+  # Tool для OpenWebUI: время, таймзоны, форматирование (OpenAPI)
+  time-ui:
+    build:
+      context: ./time-ui
+      dockerfile: Dockerfile
+    container_name: time-ui
+    expose:
+      - "8081"
+    restart: unless-stopped
+
+  # Детекция объектов на изображении (vision через Ollama)
+  hereyouare:
+    build:
+      context: ./hereyouare
+      dockerfile: Dockerfile
+    container_name: hereyouare
+    ports:
+      - "127.0.0.1:8082:8082"
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+  # Реверс-прокси для HTTPS (микрофон и т.п. на удалённых устройствах). Конфиг: ./nginx/conf.d
+  # Перед первым запуском создайте сертификаты: nginx/ssl/gen-selfsigned.sh (или см. nginx/ssl/README.txt)
+  #nginx:
+  #  image: nginx:alpine
+  #  container_name: nginx-openwebui
+  #  ports:
+  #    - 80:80
+  #    - 443:443
+  #  volumes:
+  #    # Конфиг в подключаемом volume — правьте на хосте
+  #    - ./nginx/conf.d:/etc/nginx/conf.d:ro
+  #    - ./nginx/ssl:/etc/nginx/ssl:ro
+  #  depends_on:
+  #    - openwebui
+  #  restart: unless-stopped
+
+volumes:
+  ollama: {}
+  open-webui: {}
