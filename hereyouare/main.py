@@ -2,10 +2,11 @@ import asyncio
 import base64
 import colorsys
 import io
-import json
 import logging
 import time
 from typing import Any, Dict, List
+
+import orjson
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +72,50 @@ def _prepare_image_bytes(img_bytes: bytes, max_side: int = IMAGE_MAX_SIDE) -> tu
     im.save(out, format="JPEG", quality=IMAGE_JPEG_QUALITY, optimize=False)
     return out.getvalue(), w, h
 
+def _find_json_value_end(s: str, start: int) -> int | None:
+    """Индекс закрывающей скобки первого JSON-значения (объект или массив) с учётом строк."""
+    depth_curly = 0
+    depth_square = 0
+    i = start
+    in_string = False
+    escape = False
+    quote = '"'
+    while i < len(s):
+        c = s[i]
+        if escape:
+            escape = False
+            i += 1
+            continue
+        if in_string:
+            if c == "\\":
+                escape = True
+            elif c == quote:
+                in_string = False
+            i += 1
+            continue
+        if c == '"':
+            in_string = True
+            i += 1
+            continue
+        if c == "{":
+            depth_curly += 1
+        elif c == "}":
+            depth_curly -= 1
+            if depth_curly == 0 and depth_square == 0:
+                return i
+        elif c == "[":
+            depth_square += 1
+        elif c == "]":
+            depth_square -= 1
+            if depth_square == 0 and depth_curly == 0:
+                return i
+        i += 1
+    return None
+
+
 def _safe_json_parse(text: str) -> Dict[str, Any] | list:
     """
     Парсит первый JSON-объект/массив из строки, даже если модель добавила хвост.
-    При включённом format/schema в Ollama хвоста обычно уже не будет.
     """
     text = text.strip()
     start_obj = text.find("{")
@@ -83,10 +124,10 @@ def _safe_json_parse(text: str) -> Dict[str, Any] | list:
     if not starts:
         raise ValueError("No JSON start found in model output")
     start = min(starts)
-    s = text[start:]
-    decoder = json.JSONDecoder()
-    obj, _idx = decoder.raw_decode(s)
-    return obj
+    end = _find_json_value_end(text, start)
+    if end is None:
+        raise ValueError("No complete JSON value in model output")
+    return orjson.loads(text[start : end + 1])
 
 
 def _normalize_detections(
@@ -137,8 +178,37 @@ def _palette_same_tone(n: int, hue: float = 0.55) -> List[tuple[int, int, int]]:
     return colors
 
 
+# Доля стороны прямоугольника, видимая у каждого угла (15% — линия только у углов)
+_CORNER_FRAC = 0.15
+
+
+def _draw_corner_lines(
+    draw: ImageDraw.Draw,
+    x1: int, y1: int, x2: int, y2: int,
+    color: tuple[int, int, int],
+    width: int,
+) -> None:
+    """Рисует только углы прямоугольника: по 15% длины каждой стороны у каждого угла."""
+    w = x2 - x1
+    h = y2 - y1
+    seg_w = max(1, int(w * _CORNER_FRAC))
+    seg_h = max(1, int(h * _CORNER_FRAC))
+    # верх-лево: горизонталь и вертикаль
+    draw.line([(x1, y1), (x1 + seg_w, y1)], fill=color, width=width)
+    draw.line([(x1, y1), (x1, y1 + seg_h)], fill=color, width=width)
+    # верх-право
+    draw.line([(x2 - seg_w, y1), (x2, y1)], fill=color, width=width)
+    draw.line([(x2, y1), (x2, y1 + seg_h)], fill=color, width=width)
+    # низ-право
+    draw.line([(x2, y2 - seg_h), (x2, y2)], fill=color, width=width)
+    draw.line([(x2 - seg_w, y2), (x2, y2)], fill=color, width=width)
+    # низ-лево
+    draw.line([(x1, y2 - seg_h), (x1, y2)], fill=color, width=width)
+    draw.line([(x1, y2), (x1 + seg_w, y2)], fill=color, width=width)
+
+
 def _draw_detections(img: Image.Image, detections: List[Dict[str, Any]]) -> Image.Image:
-    """Рисует прямоугольники и подписи на копии изображения. Цвета в одной тональности."""
+    """Рисует угловые рамки и подписи на копии изображения. Цвета в одной тональности."""
     out = img.convert("RGB").copy()
     draw = ImageDraw.Draw(out)
     try:
@@ -154,10 +224,9 @@ def _draw_detections(img: Image.Image, detections: List[Dict[str, Any]]) -> Imag
             continue
         x1, y1, x2, y2 = int(pos[0]), int(pos[1]), int(pos[2]), int(pos[3])
         color = colors[i % len(colors)]
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=width)
+        _draw_corner_lines(draw, x1, y1, x2, y2, color, width)
         label = str(d.get("label", ""))[:30]
         if label:
-            # подпись сверху слева от бокса, чтобы не перекрывать
             ty = max(0, y1 - 18)
             draw.text((x1, ty), label, fill=color, font=font)
     return out
