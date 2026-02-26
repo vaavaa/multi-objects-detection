@@ -60,6 +60,14 @@ FastAPI service that detects physical objects in images using an Ollama vision m
 }
 ```
 
+### Example: detection markup
+
+| Input | Annotated result (corner boxes + labels) |
+|-------|----------------------------------------|
+| ![Input image](all-objects.jpg) | ![Annotated image](all-objects-done.jpg) |
+
+*Original image and the same scene with detected objects marked (HereYouAre `/v1/detect/image`).*
+
 ### Example usage
 
 ```bash
