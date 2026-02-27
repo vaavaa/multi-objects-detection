@@ -4,21 +4,26 @@ import colorsys
 import io
 import logging
 import time
-from typing import Any, Dict, List
+import uuid
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Optional
 
 import orjson
 
 logger = logging.getLogger(__name__)
 
 import httpx
-from fastapi import Body, FastAPI, File, UploadFile, HTTPException
+from fastapi import Body, FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import Response
 from PIL import Image, ImageDraw, ImageFont
+from redis.asyncio import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 from settings import (
     FORMAT_SCHEMA,
     IMAGE_JPEG_QUALITY,
     IMAGE_MAX_SIDE,
+    JOB_RESULT_TTL_SEC,
     MODEL,
     OLLAMA_CONCURRENCY,
     OLLAMA_TEMPERATURE,
@@ -26,9 +31,36 @@ from settings import (
     OLLAMA_URL,
     PROMPT,
     PROVIDER_NAME,
+    REDIS_URL,
+    YOLO_BASE64_URL,
+    YOLO_DEFAULT_CLASS_NAMES,
+    YOLO_IOU_THRESHOLD,
+    YOLO_MAX_NUM_DETECTIONS,
+    YOLO_ONLY_BBOXS,
+    YOLO_SCORE_THRESHOLD,
+    YOLO_TIMEOUT_SEC,
 )
 
 _OLLAMA_SEM = asyncio.Semaphore(OLLAMA_CONCURRENCY)
+
+# Redis: клиент создаётся при старте, закрывается при остановке
+_redis: Optional[Redis] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _redis
+    try:
+        _redis = Redis.from_url(REDIS_URL, decode_responses=True)
+        await _redis.ping()
+    except (RedisConnectionError, OSError) as e:
+        logger.warning("Redis unavailable at startup (%s), job queue disabled", e)
+        _redis = None
+    yield
+    if _redis is not None:
+        await _redis.aclose()
+        _redis = None
+
 
 app = FastAPI(
     title="HereYouAre",
@@ -37,7 +69,17 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
+    lifespan=lifespan,
 )
+
+
+def _job_key(job_id: str) -> str:
+    return f"job:{job_id}"
+
+
+async def get_redis() -> Optional[Redis]:
+    """Возвращает клиент Redis или None, если Redis недоступен."""
+    return _redis
 
 
 @app.get("/health", tags=["Service"])
@@ -274,6 +316,122 @@ async def _run_detection(raw: bytes) -> tuple[bytes, int, int, List[Dict[str, An
     return prepared, w, h, detections
 
 
+def _parse_yolo_bboxes_response(bboxes: List[Dict[str, Any]], img_w: int, img_h: int) -> List[Dict[str, Any]]:
+    """
+    Парсит ответ YOLO base64: {"bboxes": [{"0": [x1,y1,x2,y2], "label_name": "...", "score": ...}, ...]}
+    в список {label, position: [x1,y1,x2,y2]}.
+    """
+    raw = []
+    for item in bboxes or []:
+        if not isinstance(item, dict):
+            continue
+        # Координаты в ключе "0", "1", "2" или "3" (индекс bbox в объекте)
+        coords = None
+        for k in ("0", "1", "2", "3"):
+            v = item.get(k)
+            if isinstance(v, (list, tuple)) and len(v) == 4:
+                coords = v
+                break
+        if coords is None:
+            continue
+        label = str(item.get("label_name", "")).strip()
+        if not label:
+            continue
+        raw.append({"label": label, "position": [float(coords[0]), float(coords[1]), float(coords[2]), float(coords[3])]})
+    return _normalize_detections(raw, img_w, img_h)
+
+
+async def _call_yolo_base64(
+    img_bytes: bytes,
+    class_names: List[str],
+    img_w: int = 0,
+    img_h: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    Вызов FastAPI-YOLO base64: multipart img_stream + class_names, only_bboxs=true.
+    Ответ: {"bboxes": [{"0": [x1,y1,x2,y2], "label_name": "...", "score": ...}, ...]}.
+    Возвращает список детекций {label, position: [x1,y1,x2,y2]}.
+    """
+    if not class_names:
+        class_names = list(YOLO_DEFAULT_CLASS_NAMES)
+    class_names_str = ",".join(class_names)
+    only_bboxs = "true" if YOLO_ONLY_BBOXS else "false"
+    url = (
+        f"{YOLO_BASE64_URL.rstrip('/')}"
+        f"?iou_threshold={YOLO_IOU_THRESHOLD}&score_threshold={YOLO_SCORE_THRESHOLD}"
+        f"&max_num_detections={YOLO_MAX_NUM_DETECTIONS}&only_bboxs={only_bboxs}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=YOLO_TIMEOUT_SEC) as client:
+            files = {"img_stream": ("image.jpg", img_bytes, "image/jpeg")}
+            data = {"class_names": class_names_str}
+            r = await client.post(url, files=files, data=data)
+            if r.status_code != 200:
+                logger.warning("YOLO base64 error: %s %s", r.status_code, r.text)
+                return []
+            body = r.json()
+    except Exception as e:
+        logger.warning("YOLO base64 request failed: %s", e)
+        return []
+    bboxes = body.get("bboxes") if isinstance(body, dict) else []
+    if not isinstance(bboxes, list):
+        return []
+    return _parse_yolo_bboxes_response(bboxes, img_w or 0, img_h or 0)
+
+
+async def _run_async_job(job_id: str, img_bytes: bytes, class_names_override: Optional[List[str]] = None) -> None:
+    """
+    Фоновая задача: подготовка изображения, при необходимости Qwen для списка классов,
+    вызов YOLO, сохранение результата в Redis по job_id.
+    """
+    redis = await get_redis()
+    if redis is None:
+        logger.warning("Async job %s skipped: Redis unavailable", job_id)
+        return
+    key = _job_key(job_id)
+
+    async def _set_status(payload: dict) -> bool:
+        try:
+            await redis.set(key, orjson.dumps(payload).decode(), ex=JOB_RESULT_TTL_SEC)
+            return True
+        except RedisConnectionError as e:
+            logger.warning("Redis write failed for job %s: %s", job_id, e)
+            return False
+
+    try:
+        if not await _set_status({"status": "processing", "job_id": job_id}):
+            return
+        prepared, w, h, qwen_detections = await _run_detection(img_bytes)
+        # Сразу отдаём пользователю ответ Qwen (version v1), пока ждём YOLO
+        await _set_status({
+            "status": "processing",
+            "version": "v1",
+            "job_id": job_id,
+            "image": {"width": w, "height": h},
+            "detections": qwen_detections,
+            "provider": PROVIDER_NAME,
+        })
+        class_names = class_names_override
+        if not class_names and qwen_detections:
+            class_names = [d.get("label", "") for d in qwen_detections if d.get("label")]
+        if not class_names:
+            class_names = list(YOLO_DEFAULT_CLASS_NAMES)
+        yolo_detections = await _call_yolo_base64(prepared, class_names, w, h)
+        # Финальный ответ — координаты от YOLO (version v2); если YOLO пусто — оставляем от Qwen
+        detections = yolo_detections if yolo_detections else qwen_detections
+        await _set_status({
+            "status": "done",
+            "version": "v2",
+            "job_id": job_id,
+            "image": {"width": w, "height": h},
+            "detections": detections,
+            "provider": PROVIDER_NAME,
+        })
+    except Exception as e:
+        logger.exception("Async job %s failed", job_id)
+        await _set_status({"status": "failed", "job_id": job_id, "error": str(e)})
+
+
 @app.post("/v1/detect", tags=["Detection"])
 async def detect(file: UploadFile = File(...)):
     t0 = time.time()
@@ -302,3 +460,57 @@ async def detect_image(file: UploadFile = File(...)) -> Response:
     annotated.save(buf, format="PNG")
     buf.seek(0)
     return Response(content=buf.getvalue(), media_type="image/png")
+
+
+# --- Асинхронная очередь заданий (Job_id + Redis + YOLO) ---
+
+
+def _redis_unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail="Redis unavailable; job queue disabled. Start Redis or check REDIS_URL.",
+    )
+
+
+@app.post("/v1/detect/async", tags=["Detection", "Jobs"])
+async def detect_async(
+    file: UploadFile = File(...),
+    class_names: Optional[str] = Form(None),
+) -> dict:
+    """
+    Создаёт отложенное задание: возвращает job_id сразу, детекция (Qwen + YOLO) выполняется в фоне.
+    Результат забирать через GET /v1/job/{job_id}.
+    class_names — опционально, строка через запятую (например: headphones,keyboard,mouse).
+    """
+    redis = await get_redis()
+    if redis is None:
+        raise _redis_unavailable()
+    raw = await file.read()
+    job_id = str(uuid.uuid4())
+    names_list: Optional[List[str]] = None
+    if class_names:
+        names_list = [s.strip() for s in class_names.split(",") if s.strip()]
+    asyncio.create_task(_run_async_job(job_id, raw, names_list))
+    return {"job_id": job_id, "status": "processing"}
+
+
+@app.get("/v1/job/{job_id}", tags=["Jobs"])
+async def get_job(job_id: str) -> dict:
+    """
+    Статус и результат задания по job_id.
+    status: processing (есть промежуточный результат) | done | failed.
+    version: v1 — ответ Qwen (можно показывать, пока идёт YOLO); v2 — финальный ответ с координатами YOLO.
+    В теле при наличии: image, detections, provider.
+    """
+    redis = await get_redis()
+    if redis is None:
+        raise _redis_unavailable()
+    key = _job_key(job_id)
+    try:
+        data = await redis.get(key)
+    except RedisConnectionError as e:
+        logger.warning("Redis connection error in get_job: %s", e)
+        raise _redis_unavailable()
+    if data is None:
+        raise HTTPException(status_code=404, detail="Job not found or expired")
+    return orjson.loads(data)

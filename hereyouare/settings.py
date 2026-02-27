@@ -3,7 +3,8 @@
 При необходимости можно добавить чтение из переменных окружения (os.environ).
 """
 
-from typing import Any, Dict
+import os
+from typing import Any, Dict, List
 
 # Ollama API
 OLLAMA_URL = "http://ollama:11434/api/generate"  # в docker-compose это имя сервиса
@@ -43,3 +44,26 @@ OLLAMA_TEMPERATURE = 0.1  # ограничение "болтливости" мо
 
 # Метаданные в ответе
 PROVIDER_NAME = "qwen2.5vl"
+
+# --- Очередь заданий (Redis) ---
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+JOB_RESULT_TTL_SEC = 3600  # время жизни результата задания в Redis (1 ч)
+
+# --- FastAPI-YOLO (YOLO World): детекция по заданным классам ---
+# Базовый URL эндпоинта base64 (без query). В Docker: http://fastapi-yolo:8001
+YOLO_BASE64_URL = os.environ.get(
+    "YOLO_BASE64_URL",
+    "http://0.0.0.0:8001/api/v1/yworld/base64",
+)
+YOLO_IOU_THRESHOLD = 0.5
+YOLO_SCORE_THRESHOLD = 0.2
+YOLO_MAX_NUM_DETECTIONS = 5
+YOLO_ONLY_BBOXS = True  # only_bboxs=true в query
+YOLO_TIMEOUT_SEC = 60
+# Классы по умолчанию, если не переданы и не получены из Qwen
+YOLO_DEFAULT_CLASS_NAMES: List[str] = [
+    "headphones",
+    "keyboard",
+    "mouse",
+    "mousepad",
+]
