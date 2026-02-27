@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 import orjson
+import xxhash
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,7 @@ from redis.asyncio import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from settings import (
+    CACHE_TTL_SEC,
     FORMAT_SCHEMA,
     IMAGE_JPEG_QUALITY,
     IMAGE_MAX_SIDE,
@@ -75,6 +77,15 @@ app = FastAPI(
 
 def _job_key(job_id: str) -> str:
     return f"job:{job_id}"
+
+
+def _image_hash(img_bytes: bytes) -> str:
+    """Хеш содержимого изображения (xxhash) для кеширования."""
+    return xxhash.xxh64(img_bytes).hexdigest()
+
+
+def _cache_key(img_hash: str) -> str:
+    return f"cache:img:{img_hash}"
 
 
 async def get_redis() -> Optional[Redis]:
@@ -379,10 +390,14 @@ async def _call_yolo_base64(
     return _parse_yolo_bboxes_response(bboxes, img_w or 0, img_h or 0)
 
 
-async def _run_async_job(job_id: str, img_bytes: bytes, class_names_override: Optional[List[str]] = None) -> None:
+async def _run_async_job(
+    job_id: str,
+    img_bytes: bytes,
+    class_names_override: Optional[List[str]] = None,
+    image_hash: Optional[str] = None,
+) -> None:
     """
-    Фоновая задача: подготовка изображения, при необходимости Qwen для списка классов,
-    вызов YOLO, сохранение результата в Redis по job_id.
+    Фоновая задача: подготовка изображения, Qwen, YOLO, сохранение в job и в кеш по хешу изображения.
     """
     redis = await get_redis()
     if redis is None:
@@ -419,14 +434,25 @@ async def _run_async_job(job_id: str, img_bytes: bytes, class_names_override: Op
         yolo_detections = await _call_yolo_base64(prepared, class_names, w, h)
         # Финальный ответ — координаты от YOLO (version v2); если YOLO пусто — оставляем от Qwen
         detections = yolo_detections if yolo_detections else qwen_detections
-        await _set_status({
+        result = {
             "status": "done",
             "version": "v2",
             "job_id": job_id,
             "image": {"width": w, "height": h},
             "detections": detections,
             "provider": PROVIDER_NAME,
-        })
+        }
+        await _set_status(result)
+        # Сохраняем в кеш по хешу изображения, чтобы не пересчитывать ту же картинку
+        if image_hash:
+            try:
+                await redis.set(
+                    _cache_key(image_hash),
+                    orjson.dumps(result).decode(),
+                    ex=CACHE_TTL_SEC,
+                )
+            except RedisConnectionError:
+                pass
     except Exception as e:
         logger.exception("Async job %s failed", job_id)
         await _set_status({"status": "failed", "job_id": job_id, "error": str(e)})
@@ -480,17 +506,34 @@ async def detect_async(
     """
     Создаёт отложенное задание: возвращает job_id сразу, детекция (Qwen + YOLO) выполняется в фоне.
     Результат забирать через GET /v1/job/{job_id}.
+    Одинаковые по хешу изображения берутся из кеша — пересчёт не выполняется.
     class_names — опционально, строка через запятую (например: headphones,keyboard,mouse).
     """
     redis = await get_redis()
     if redis is None:
         raise _redis_unavailable()
     raw = await file.read()
+    img_hash = _image_hash(raw)
     job_id = str(uuid.uuid4())
+    # Проверяем кеш: если для этого хеша уже есть готовый результат (v2), отдаём его по новому job_id
+    try:
+        cached = await redis.get(_cache_key(img_hash))
+        if cached:
+            data = orjson.loads(cached)
+            if data.get("status") == "done" and data.get("version") == "v2":
+                data["job_id"] = job_id
+                await redis.set(
+                    _job_key(job_id),
+                    orjson.dumps(data).decode(),
+                    ex=JOB_RESULT_TTL_SEC,
+                )
+                return {"job_id": job_id, "status": "done", "cached": True}
+    except RedisConnectionError:
+        pass
     names_list: Optional[List[str]] = None
     if class_names:
         names_list = [s.strip() for s in class_names.split(",") if s.strip()]
-    asyncio.create_task(_run_async_job(job_id, raw, names_list))
+    asyncio.create_task(_run_async_job(job_id, raw, names_list, image_hash=img_hash))
     return {"job_id": job_id, "status": "processing"}
 
 

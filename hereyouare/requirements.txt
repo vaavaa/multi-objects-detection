@@ -6,3 +6,4 @@ orjson
 httpx
 Pillow
 redis>=5.0
+xxhash>=3.4

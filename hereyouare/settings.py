@@ -48,6 +48,7 @@ PROVIDER_NAME = "qwen2.5vl"
 # --- Очередь заданий (Redis) ---
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 JOB_RESULT_TTL_SEC = 3600  # время жизни результата задания в Redis (1 ч)
+CACHE_TTL_SEC = 86400  # TTL кеша по хешу изображения (24 ч)
 
 # --- FastAPI-YOLO (YOLO World): детекция по заданным классам ---
 # Базовый URL эндпоинта base64 (без query). В Docker: http://fastapi-yolo:8001
