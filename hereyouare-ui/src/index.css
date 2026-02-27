@@ -1,0 +1,129 @@
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, sans-serif;
+  background: #1a1a2e;
+  color: #e8e8e8;
+  min-height: 100vh;
+}
+
+.app {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+.header {
+  margin-bottom: 1.5rem;
+}
+
+.header h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.5rem;
+}
+
+.main {
+  min-height: 60vh;
+}
+
+.upload-zone {
+  border: 2px dashed rgba(200, 200, 200, 0.5);
+  border-radius: 8px;
+  padding: 3rem;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.upload-zone:hover,
+.upload-zone.dragover {
+  border-color: #4a9;
+  background: rgba(70, 160, 180, 0.08);
+}
+
+.file-input {
+  position: absolute;
+  width: 0;
+  height: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.upload-label {
+  display: block;
+  color: #999;
+}
+
+.preview-wrap {
+  position: relative;
+  margin-top: 1rem;
+  display: inline-block;
+}
+
+.preview-img {
+  display: block;
+  max-width: 100%;
+  border-radius: 4px;
+}
+
+.preview-canvas {
+  position: absolute;
+  left: 0;
+  top: 0;
+  display: block;
+  max-width: 100%;
+  pointer-events: none;
+}
+
+.status,
+.error {
+  margin-top: 0.75rem;
+  font-size: 0.9rem;
+}
+
+.status {
+  color: #8ac;
+}
+
+.error {
+  color: #c66;
+}
+
+.start-btn {
+  margin-top: 1rem;
+  padding: 0.6rem 1.2rem;
+  font-size: 1rem;
+  color: #e8e8e8;
+  background: #2a4a6e;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.start-btn:hover:not(:disabled) {
+  background: #3a5a7e;
+}
+
+.start-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@keyframes boxFly {
+  from {
+    transform: translate(-50%, -50%) scale(0.3);
+    opacity: 1;
+  }
+  to {
+    transform: translate(0, 0) scale(1);
+    opacity: 1;
+  }
+}
+
+.anim-box {
+  position: absolute;
+  box-sizing: border-box;
+  animation: boxFly 0.3s ease-out forwards;
+}
