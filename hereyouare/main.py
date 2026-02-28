@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 import httpx
 from fastapi import Body, FastAPI, File, Form, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from PIL import Image, ImageDraw, ImageFont
 from redis.asyncio import Redis
@@ -26,6 +27,7 @@ from settings import (
     IMAGE_JPEG_QUALITY,
     IMAGE_MAX_SIDE,
     JOB_RESULT_TTL_SEC,
+    V2_DELAY_MS,
     MODEL,
     OLLAMA_CONCURRENCY,
     OLLAMA_TEMPERATURE,
@@ -33,7 +35,12 @@ from settings import (
     OLLAMA_URL,
     PROMPT,
     PROVIDER_NAME,
+    QWEN_BIG_DETECTION_AREA_FRAC,
+    QWEN_CROP_INSET_FRAC,
+    QWEN_CROP_MAX_ITERATIONS,
     REDIS_URL,
+    USE_CACHE,
+    USE_REDIS,
     YOLO_BASE64_URL,
     YOLO_DEFAULT_CLASS_NAMES,
     YOLO_IOU_THRESHOLD,
@@ -52,12 +59,16 @@ _redis: Optional[Redis] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _redis
-    try:
-        _redis = Redis.from_url(REDIS_URL, decode_responses=True)
-        await _redis.ping()
-    except (RedisConnectionError, OSError) as e:
-        logger.warning("Redis unavailable at startup (%s), job queue disabled", e)
+    if not USE_REDIS:
         _redis = None
+        logger.info("Redis disabled by config (USE_REDIS=false), job queue disabled")
+    else:
+        try:
+            _redis = Redis.from_url(REDIS_URL, decode_responses=True)
+            await _redis.ping()
+        except (RedisConnectionError, OSError) as e:
+            logger.warning("Redis unavailable at startup (%s), job queue disabled", e)
+            _redis = None
     yield
     if _redis is not None:
         await _redis.aclose()
@@ -72,6 +83,14 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -285,70 +304,122 @@ def _draw_detections(img: Image.Image, detections: List[Dict[str, Any]]) -> Imag
     return out
 
 
+def _detection_area(d: Dict[str, Any]) -> float:
+    """Площадь бокса детекции (position: [x1,y1,x2,y2])."""
+    pos = d.get("position")
+    if not pos or len(pos) != 4:
+        return 0.0
+    x1, y1, x2, y2 = pos[0], pos[1], pos[2], pos[3]
+    return (x2 - x1) * (y2 - y1)
+
+
 async def _run_detection(raw: bytes) -> tuple[bytes, int, int, List[Dict[str, Any]]]:
-    """Общая логика: подготовка изображения, запрос к Ollama, парсинг, нормализация."""
-    try:
-        prepared, w, h = _prepare_image_bytes(raw, max_side=IMAGE_MAX_SIDE)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
+    """
+    Общая логика: подготовка изображения, запрос к Ollama, парсинг, нормализация.
+    Если одна детекция занимает > 95% площади кадра — обрезаем по ней (отступ 0.5% с каждой стороны)
+    и повторяем детекцию; макс. 3 итерации.
+    """
+    raw_current = raw
+    prepared, w, h = None, 0, 0
+    detections: List[Dict[str, Any]] = []
 
-    img_b64 = base64.b64encode(prepared).decode("utf-8")
-    payload = {
-        "model": MODEL,
-        "prompt": PROMPT,
-        "images": [img_b64],
-        "stream": False,
-        "format": FORMAT_SCHEMA,
-        "options": {"temperature": OLLAMA_TEMPERATURE},
-    }
+    for iteration in range(QWEN_CROP_MAX_ITERATIONS):
+        try:
+            prepared, w, h = _prepare_image_bytes(raw_current, max_side=IMAGE_MAX_SIDE)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
 
-    async with _OLLAMA_SEM:
-        async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SEC) as client:
-            r = await client.post(OLLAMA_URL, json=payload)
-            if r.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"Ollama error: {r.text}")
+        img_b64 = base64.b64encode(prepared).decode("utf-8")
+        payload = {
+            "model": MODEL,
+            "prompt": PROMPT,
+            "images": [img_b64],
+            "stream": False,
+            "format": FORMAT_SCHEMA,
+            "options": {"temperature": OLLAMA_TEMPERATURE},
+        }
 
-    data = r.json()
-    model_text = data.get("response", "")
-    logger.info("Ollama model response (before parse): %s", model_text)
+        async with _OLLAMA_SEM:
+            async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SEC) as client:
+                r = await client.post(OLLAMA_URL, json=payload)
+                if r.status_code != 200:
+                    raise HTTPException(status_code=502, detail=f"Ollama error: {r.text}")
 
-    try:
-        parsed = _safe_json_parse(model_text)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Model did not return JSON: {e}")
+        data = r.json()
+        model_text = data.get("response", "")
+        logger.info("Ollama model response (before parse): %s", model_text)
 
-    if isinstance(parsed, list):
-        raw_detections = parsed
-    elif isinstance(parsed, dict):
-        raw_detections = parsed.get("detections", [])
-    else:
-        raw_detections = []
-    detections = _normalize_detections(raw_detections, w, h)
+        try:
+            parsed = _safe_json_parse(model_text)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Model did not return JSON: {e}")
+
+        if isinstance(parsed, list):
+            raw_detections = parsed
+        elif isinstance(parsed, dict):
+            raw_detections = parsed.get("detections", [])
+        else:
+            raw_detections = []
+        detections = _normalize_detections(raw_detections, w, h)
+
+        img_area = w * h
+        if not img_area or not detections:
+            return prepared, w, h, detections
+
+        max_d = max(detections, key=_detection_area)
+        max_area = _detection_area(max_d)
+        if max_area <= QWEN_BIG_DETECTION_AREA_FRAC * img_area:
+            return prepared, w, h, detections
+
+        if iteration == QWEN_CROP_MAX_ITERATIONS - 1:
+            return prepared, w, h, detections
+
+        x1, y1, x2, y2 = max_d["position"]
+        box_w, box_h = x2 - x1, y2 - y1
+        inset_x = QWEN_CROP_INSET_FRAC * box_w
+        inset_y = QWEN_CROP_INSET_FRAC * box_h
+        crop_x1 = max(0, x1 + inset_x)
+        crop_x2 = min(w, x2 - inset_x)
+        crop_y1 = max(0, y1 + inset_y)
+        crop_y2 = min(h, y2 - inset_y)
+        if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+            return prepared, w, h, detections
+
+        img = Image.open(io.BytesIO(prepared)).convert("RGB")
+        cropped = img.crop((int(crop_x1), int(crop_y1), int(crop_x2), int(crop_y2)))
+        buf = io.BytesIO()
+        cropped.save(buf, format="JPEG", quality=IMAGE_JPEG_QUALITY, optimize=False)
+        raw_current = buf.getvalue()
+
     return prepared, w, h, detections
 
 
 def _parse_yolo_bboxes_response(bboxes: List[Dict[str, Any]], img_w: int, img_h: int) -> List[Dict[str, Any]]:
     """
-    Парсит ответ YOLO base64: {"bboxes": [{"0": [x1,y1,x2,y2], "label_name": "...", "score": ...}, ...]}
-    в список {label, position: [x1,y1,x2,y2]}.
+    Парсит ответ YOLO base64: bbox в ключе "0" или "bbox" [x1,y1,x2,y2], метка в "label_name" или "label".
+    Возвращает список {label, position: [x1,y1,x2,y2]}.
     """
     raw = []
     for item in bboxes or []:
         if not isinstance(item, dict):
             continue
-        # Координаты в ключе "0", "1", "2" или "3" (индекс bbox в объекте)
         coords = None
-        for k in ("0", "1", "2", "3"):
+        for k in ("0", "1", "2", "3", "bbox"):
             v = item.get(k)
             if isinstance(v, (list, tuple)) and len(v) == 4:
                 coords = v
                 break
         if coords is None:
             continue
-        label = str(item.get("label_name", "")).strip()
+        label = str(item.get("label_name") or item.get("label", "")).strip()
         if not label:
             continue
-        raw.append({"label": label, "position": [float(coords[0]), float(coords[1]), float(coords[2]), float(coords[3])]})
+        x1, y1, x2, y2 = float(coords[0]), float(coords[1]), float(coords[2]), float(coords[3])
+        # Если координаты в диапазоне 0..1 (нормализованные), переводим в пиксели
+        if img_w and img_h and 0 <= x1 <= 1 and 0 <= y1 <= 1 and 0 <= x2 <= 1 and 0 <= y2 <= 1:
+            x1, x2 = x1 * img_w, x2 * img_w
+            y1, y2 = y1 * img_h, y2 * img_h
+        raw.append({"label": label, "position": [x1, y1, x2, y2]})
     return _normalize_detections(raw, img_w, img_h)
 
 
@@ -384,10 +455,20 @@ async def _call_yolo_base64(
     except Exception as e:
         logger.warning("YOLO base64 request failed: %s", e)
         return []
-    bboxes = body.get("bboxes") if isinstance(body, dict) else []
-    if not isinstance(bboxes, list):
+    if not isinstance(body, dict):
+        logger.warning("YOLO base64: response body is not dict: %s", type(body))
         return []
-    return _parse_yolo_bboxes_response(bboxes, img_w or 0, img_h or 0)
+    bboxes = body.get("bboxes", body.get("bbox", []))
+    if not isinstance(bboxes, list):
+        logger.warning("YOLO base64: bboxes not a list, body keys=%s", list(body.keys()))
+        return []
+    logger.info("YOLO base64: response keys=%s, len(bboxes)=%d", list(body.keys()), len(bboxes))
+    if bboxes and isinstance(bboxes[0], dict):
+        logger.info("YOLO base64: first bbox keys=%s", list(bboxes[0].keys()))
+    out = _parse_yolo_bboxes_response(bboxes, img_w or 0, img_h or 0)
+    if bboxes and not out:
+        logger.warning("YOLO base64: parsed 0 detections from %d bbox items (check bbox format)", len(bboxes))
+    return out
 
 
 async def _run_async_job(
@@ -417,6 +498,7 @@ async def _run_async_job(
         if not await _set_status({"status": "processing", "job_id": job_id}):
             return
         prepared, w, h, qwen_detections = await _run_detection(img_bytes)
+        logger.info("Async job %s: Qwen returned %d detections", job_id, len(qwen_detections))
         # Сразу отдаём пользователю ответ Qwen (version v1), пока ждём YOLO
         await _set_status({
             "status": "processing",
@@ -431,7 +513,14 @@ async def _run_async_job(
             class_names = [d.get("label", "") for d in qwen_detections if d.get("label")]
         if not class_names:
             class_names = list(YOLO_DEFAULT_CLASS_NAMES)
+        logger.info("Async job %s: calling YOLO with class_names=%s", job_id, class_names)
         yolo_detections = await _call_yolo_base64(prepared, class_names, w, h)
+        logger.info(
+            "Async job %s: YOLO returned %d detections; v2 will use %s",
+            job_id,
+            len(yolo_detections),
+            "yolo" if yolo_detections else "qwen (yolo empty)",
+        )
         # Финальный ответ — координаты от YOLO (version v2); если YOLO пусто — оставляем от Qwen
         detections = yolo_detections if yolo_detections else qwen_detections
         result = {
@@ -442,9 +531,11 @@ async def _run_async_job(
             "detections": detections,
             "provider": PROVIDER_NAME,
         }
+        if V2_DELAY_MS > 0:
+            await asyncio.sleep(V2_DELAY_MS / 1000.0)
         await _set_status(result)
-        # Сохраняем в кеш по хешу изображения, чтобы не пересчитывать ту же картинку
-        if image_hash:
+        # Сохраняем в кеш по хешу изображения, если кеширование включено
+        if USE_CACHE and image_hash:
             try:
                 await redis.set(
                     _cache_key(image_hash),
@@ -515,21 +606,22 @@ async def detect_async(
     raw = await file.read()
     img_hash = _image_hash(raw)
     job_id = str(uuid.uuid4())
-    # Проверяем кеш: если для этого хеша уже есть готовый результат (v2), отдаём его по новому job_id
-    try:
-        cached = await redis.get(_cache_key(img_hash))
-        if cached:
-            data = orjson.loads(cached)
-            if data.get("status") == "done" and data.get("version") == "v2":
-                data["job_id"] = job_id
-                await redis.set(
-                    _job_key(job_id),
-                    orjson.dumps(data).decode(),
-                    ex=JOB_RESULT_TTL_SEC,
-                )
-                return {"job_id": job_id, "status": "done", "cached": True}
-    except RedisConnectionError:
-        pass
+    # Проверяем кеш (если кеширование включено): готовый результат (v2) отдаём по новому job_id
+    if USE_CACHE:
+        try:
+            cached = await redis.get(_cache_key(img_hash))
+            if cached:
+                data = orjson.loads(cached)
+                if data.get("status") == "done" and data.get("version") == "v2":
+                    data["job_id"] = job_id
+                    await redis.set(
+                        _job_key(job_id),
+                        orjson.dumps(data).decode(),
+                        ex=JOB_RESULT_TTL_SEC,
+                    )
+                    return {"job_id": job_id, "status": "done", "cached": True}
+        except RedisConnectionError:
+            pass
     names_list: Optional[List[str]] = None
     if class_names:
         names_list = [s.strip() for s in class_names.split(",") if s.strip()]
@@ -557,3 +649,20 @@ async def get_job(job_id: str) -> dict:
     if data is None:
         raise HTTPException(status_code=404, detail="Job not found or expired")
     return orjson.loads(data)
+
+
+@app.post("/v1/cache/clear", tags=["Cache"])
+async def clear_redis_cache() -> dict:
+    """
+    Очистить всё содержимое текущей БД Redis (все ключи: кеш распознавания и задания).
+    Без параметров. Redis должен быть включён (USE_REDIS=true).
+    """
+    redis = await get_redis()
+    if redis is None:
+        raise _redis_unavailable()
+    try:
+        await redis.flushdb()
+        return {"status": "ok", "message": "Redis cache cleared"}
+    except RedisConnectionError as e:
+        logger.warning("Redis flushdb failed: %s", e)
+        raise _redis_unavailable()

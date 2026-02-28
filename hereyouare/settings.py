@@ -45,20 +45,29 @@ OLLAMA_TEMPERATURE = 0.1  # ограничение "болтливости" мо
 # Метаданные в ответе
 PROVIDER_NAME = "qwen2.5vl"
 
+# Qwen: при детекции > доли площади кадра — обрезка по боксу (отступ с каждой стороны) и повтор
+QWEN_CROP_MAX_ITERATIONS = 3
+QWEN_BIG_DETECTION_AREA_FRAC = 0.90  # порог: если одна детекция больше — кроп и повтор
+QWEN_CROP_INSET_FRAC = 0.005  # 0.5% с каждой стороны при обрезке
+
 # --- Очередь заданий (Redis) ---
+USE_REDIS = os.environ.get("USE_REDIS", "true").lower() in ("1", "true", "yes")
+USE_CACHE = os.environ.get("USE_CACHE", "false").lower() in ("1", "true", "yes")  # сохранять и отдавать кеш распознавания
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 JOB_RESULT_TTL_SEC = 3600  # время жизни результата задания в Redis (1 ч)
 CACHE_TTL_SEC = 86400  # TTL кеша по хешу изображения (24 ч)
+# Задержка (мс) между записью v1 в Redis и записью v2 после получения результата YOLO
+V2_DELAY_MS = int(os.environ.get("V2_DELAY_MS", "0"))
 
 # --- FastAPI-YOLO (YOLO World): детекция по заданным классам ---
-# Базовый URL эндпоинта base64 (без query). В Docker: http://fastapi-yolo:8001
+# Базовый URL эндпоинта base64. Из контейнера до хоста: host.docker.internal (Docker 20.10+)
 YOLO_BASE64_URL = os.environ.get(
     "YOLO_BASE64_URL",
-    "http://0.0.0.0:8001/api/v1/yworld/base64",
+    "http://host.docker.internal:8001/api/v1/yworld/base64",
 )
 YOLO_IOU_THRESHOLD = 0.5
 YOLO_SCORE_THRESHOLD = 0.2
-YOLO_MAX_NUM_DETECTIONS = 5
+YOLO_MAX_NUM_DETECTIONS = 8
 YOLO_ONLY_BBOXS = True  # only_bboxs=true в query
 YOLO_TIMEOUT_SEC = 60
 # Классы по умолчанию, если не переданы и не получены из Qwen
