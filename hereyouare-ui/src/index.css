@@ -98,10 +98,29 @@ body {
   border: 1px solid rgba(200, 200, 200, 0.15);
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.12);
+  scrollbar-color: rgba(80, 90, 110, 0.6) #1a1a2e;
+  scrollbar-width: thin;
+}
+
+/* Полоса прокрутки в тон фону страницы (#1a1a2e) */
+.strip::-webkit-scrollbar {
+  height: 8px;
+}
+.strip::-webkit-scrollbar-track {
+  background: #1a1a2e;
+  border-radius: 4px;
+}
+.strip::-webkit-scrollbar-thumb {
+  background: rgba(80, 90, 110, 0.6);
+  border-radius: 4px;
+}
+.strip::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 110, 130, 0.7);
 }
 
 .strip-inner {
   display: flex;
+  align-items: center;
   gap: 0.5rem;
   padding: 0.5rem;
 }
@@ -118,6 +137,54 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+.strip-item--crop {
+  padding: 0;
+  overflow: hidden;
+  width: auto;
+  min-width: 0;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  cursor: pointer;
+}
+
+.strip-item--crop:hover {
+  border-color: rgba(200, 220, 240, 0.35);
+}
+
+.strip-item--crop.strip-item--selected {
+  border-color: #4a9;
+  box-shadow: 0 0 0 2px rgba(74, 153, 153, 0.4);
+}
+
+.strip-item--full {
+  min-width: 72px;
+  max-width: 72px;
+}
+
+.strip-crop-label {
+  flex: 0 0 auto;
+  font-size: 0.7rem;
+  line-height: 1.2;
+  color: rgba(200, 220, 230, 0.9);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+  padding: 0.15rem 0.25rem 0;
+}
+
+.strip-crop-img {
+  flex: 1;
+  min-height: 0;
+  display: block;
+  width: auto;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 6px;
 }
 
 .strip-item.muted {

@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 
 const API_BASE = import.meta.env.VITE_HEREYOUARE_URL || 'http://localhost:8082';
 const BLINK_CYCLE_MS = 2000;
@@ -7,6 +7,10 @@ const V2_FADE_OUT_MS = 500;  // старые рамки (v1): 100% → 20% за 
 const V2_FADE_IN_MS = 500;   // новые рамки (v2): 30% → 100% за 0.5 с
 const V2_FADE_OUT_MIN = 0.2;
 const V2_FADE_IN_START = 0.3;
+const HIGHLIGHT_BLINK_CYCLE_MS = 600; // один цикл: 0.6 с (0.3 с 100%→20%, 0.3 с 20%→100%)
+const HIGHLIGHT_BLINK_HALF_MS = 300;
+const HIGHLIGHT_BLINK_MIN = 0.2;
+const HIGHLIGHT_STROKE_MUL = 1.5;
 
 const DEBUG_DRAW = false; // подробные логи отрисовки и опроса (отключить в проде)
 
@@ -22,6 +26,8 @@ export default function App() {
   const [detections, setDetections] = useState([]);
   const [resultImageSize, setResultImageSize] = useState(null);
   const [resultVersion, setResultVersion] = useState(null); // null | 'v1' | 'v2' — что сейчас отображаем; только v2 завершает задачу
+  const [cropUrls, setCropUrls] = useState([]); // data URL миниатюр по bbox v2, порядок по (x1,y1)
+  const [selectedDetectionIndex, setSelectedDetectionIndex] = useState(null); // null = вся картинка, иначе индекс в detections
   const [error, setError] = useState(null);
   const pollIntervalMs = 250;
 
@@ -38,6 +44,8 @@ export default function App() {
     setDetections([]);
     setResultImageSize(null);
     setResultVersion(null);
+    setCropUrls([]);
+    setSelectedDetectionIndex(null);
     v1AnimationStartedRef.current = false;
     setStatus('idle');
     setError(null);
@@ -59,6 +67,8 @@ export default function App() {
       setDetections([]);
       setResultImageSize(null);
       setResultVersion(null);
+      setCropUrls([]);
+      setSelectedDetectionIndex(null);
       v2PayloadRef.current = null;
       v1AnimationStartedRef.current = false;
       setStatus('processing');
@@ -156,7 +166,74 @@ export default function App() {
   const blinkRef = useRef({ running: false, startAt: 0, rafId: 0 });
   const doneTimerRef = useRef(0);
   const v2TransitionRef = useRef(null); // { phase: 'fadeOut'|'fadeIn', oldDetections, newDetections, imageSize, startTime, rafId }
+  const highlightBlinkRef = useRef({ startTime: 0, rafId: 0, done: true });
   const [stripHeightPx, setStripHeightPx] = useState(0);
+
+  // Индексы в detections, отсортированные по (x1,y1) — порядок плиток в strip совпадает с рамками на canvas
+  const sortedIndicesForStrip = useMemo(() => {
+    if (!detections?.length || resultVersion !== 'v2') return [];
+    return [...detections]
+      .map((_, i) => i)
+      .sort((a, b) => {
+        const ap = detections[a].position || [];
+        const bp = detections[b].position || [];
+        const ax = ap[0] ?? 0;
+        const ay = ap[1] ?? 0;
+        const bx = bp[0] ?? 0;
+        const by = bp[1] ?? 0;
+        return ax !== bx ? ax - bx : ay - by;
+      });
+  }, [detections, resultVersion]);
+
+  const sortedDetectionsForStrip = useMemo(
+    () => sortedIndicesForStrip.map((i) => detections[i]),
+    [detections, sortedIndicesForStrip]
+  );
+
+  // Генерация кропов по bbox для strip после v2
+  useEffect(() => {
+    if (status !== 'done' || resultVersion !== 'v2' || !preview || !resultImageSize?.w || !resultImageSize?.h || !sortedDetectionsForStrip.length) {
+      setCropUrls([]);
+      return;
+    }
+    let cancelled = false;
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      if (cancelled) return;
+      const iw = img.naturalWidth;
+      const ih = img.naturalHeight;
+      const apiW = resultImageSize.w;
+      const apiH = resultImageSize.h;
+      const scaleX = iw / apiW;
+      const scaleY = ih / apiH;
+      const urls = [];
+      for (const d of sortedDetectionsForStrip) {
+        const p = d.position || [];
+        const x1 = Math.max(0, Math.min(iw, (p[0] ?? 0) * scaleX));
+        const y1 = Math.max(0, Math.min(ih, (p[1] ?? 0) * scaleY));
+        const x2 = Math.max(0, Math.min(iw, (p[2] ?? 0) * scaleX));
+        const y2 = Math.max(0, Math.min(ih, (p[3] ?? 0) * scaleY));
+        let w = Math.max(1, x2 - x1);
+        let h = Math.max(1, y2 - y1);
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, x1, y1, w, h, 0, 0, w, h);
+        urls.push(canvas.toDataURL('image/jpeg', 0.85));
+      }
+      if (!cancelled) setCropUrls(urls);
+    };
+    img.onerror = () => {
+      if (!cancelled) setCropUrls([]);
+    };
+    img.src = preview;
+    return () => {
+      cancelled = true;
+      setCropUrls([]);
+    };
+  }, [status, resultVersion, preview, resultImageSize, sortedDetectionsForStrip]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -266,6 +343,19 @@ export default function App() {
         if (x2 - x1 >= 2 && y2 - y1 >= 2) {
           drawCorner(ctx, x1, y1, x2, y2, c[i % c.length], lineW, opacity);
         }
+      }
+    };
+
+    const drawBoxesWithHighlight = (list, colors, highlightIndex, highlightAlpha) => {
+      if (!list?.length) return;
+      const c = colors.length ? colors : makeColors(list.length);
+      for (let i = 0; i < list.length; i++) {
+        const [x1, y1, x2, y2] = scale(list[i].position || [], null);
+        if (x2 - x1 < 2 || y2 - y1 < 2) continue;
+        const isHighlight = i === highlightIndex;
+        const lw = isHighlight ? lineW * HIGHLIGHT_STROKE_MUL : lineW;
+        const alpha = isHighlight ? highlightAlpha : 1;
+        drawCorner(ctx, x1, y1, x2, y2, c[i % c.length], lw, alpha);
       }
     };
 
@@ -455,15 +545,53 @@ export default function App() {
       log('draw: branch done', { count: detections?.length });
       v1AnimationStartedRef.current = false;
       stopBlink();
-      drawBase();
-      drawBoxes(detections, makeColors(detections?.length || 0));
+      const colors = makeColors(detections?.length || 0);
+
+      if (selectedDetectionIndex === null) {
+        if (highlightBlinkRef.current.rafId) {
+          cancelAnimationFrame(highlightBlinkRef.current.rafId);
+          highlightBlinkRef.current = { startTime: 0, rafId: 0, done: true };
+        }
+        drawBase();
+        drawBoxes(detections, colors);
+        return;
+      }
+
+      const hi = highlightBlinkRef.current;
+      if (hi.rafId) {
+        cancelAnimationFrame(hi.rafId);
+        hi.rafId = 0;
+        hi.done = true;
+      }
+      hi.startTime = performance.now();
+      hi.done = false;
+      const runHighlightTick = () => {
+        const t = highlightBlinkRef.current;
+        if (!t || t.done) return;
+        const el = performance.now() - t.startTime;
+        const cycleMs = HIGHLIGHT_BLINK_CYCLE_MS;
+        const half = HIGHLIGHT_BLINK_HALF_MS;
+        const phase = el % cycleMs;
+        let alpha = 1;
+        if (phase < half) {
+          alpha = 1 - (1 - HIGHLIGHT_BLINK_MIN) * (phase / half);
+        } else {
+          alpha = HIGHLIGHT_BLINK_MIN + (1 - HIGHLIGHT_BLINK_MIN) * ((phase - half) / half);
+        }
+        drawBase();
+        drawBoxesWithHighlight(detections, colors, selectedDetectionIndex, alpha);
+        if (!highlightBlinkRef.current.done) {
+          highlightBlinkRef.current.rafId = requestAnimationFrame(runHighlightTick);
+        }
+      };
+      highlightBlinkRef.current.rafId = requestAnimationFrame(runHighlightTick);
       return;
     }
 
     log('draw: branch idle/other');
     stopBlink();
     drawBase();
-  }, [status, detections, resultImageSize, resultVersion, v2Received]);
+  }, [status, detections, resultImageSize, resultVersion, v2Received, selectedDetectionIndex]);
 
   return (
     <div className="app">
@@ -501,17 +629,51 @@ export default function App() {
                 <div className="media-frame">
                   <canvas ref={canvasRef} className="preview-canvas" />
 
-                  {/* 3) Нижняя область: горизонтальная прокрутка (25% высоты viewer, ширина как у картинки) */}
+                  {/* 3) Нижняя область: первая плитка — вся картинка (по умолчанию выделена), далее кропы по bbox v2 */}
                   <div className="strip" style={{ height: stripHeightPx ? `${stripHeightPx}px` : undefined }}>
                     <div className="strip-inner">
-                      {(detections || []).map((_, i) => (
-                        <div key={i} className="strip-item">
-                          #{i + 1}
-                        </div>
-                      ))}
-                      {(!detections || detections.length === 0) && (
-                        <div className="strip-item muted">Объекты появятся после разметки</div>
-                      )}
+                      {status === 'done' && cropUrls.length > 0
+                        ? (
+                            <>
+                              <div
+                                role="button"
+                                tabIndex={0}
+                                className={`strip-item strip-item--crop strip-item--full ${selectedDetectionIndex === null ? 'strip-item--selected' : ''}`}
+                                style={{ height: stripHeightPx > 0 ? stripHeightPx - 8 : undefined }}
+                                onClick={() => setSelectedDetectionIndex(null)}
+                                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') setSelectedDetectionIndex(null); }}
+                              >
+                                <span className="strip-crop-label">Вся картинка</span>
+                                <img src={preview} alt="" className="strip-crop-img" />
+                              </div>
+                              {sortedDetectionsForStrip.map((d, i) => {
+                                const detIndex = sortedIndicesForStrip[i];
+                                return (
+                                  <div
+                                    key={detIndex}
+                                    role="button"
+                                    tabIndex={0}
+                                    className={`strip-item strip-item--crop ${selectedDetectionIndex === detIndex ? 'strip-item--selected' : ''}`}
+                                    style={{ height: stripHeightPx > 0 ? stripHeightPx - 8 : undefined }}
+                                    onClick={() => setSelectedDetectionIndex(detIndex)}
+                                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') setSelectedDetectionIndex(detIndex); }}
+                                  >
+                                    <span className="strip-crop-label">{d.label ?? d.label_name ?? ''}</span>
+                                    <img src={cropUrls[i]} alt="" className="strip-crop-img" />
+                                  </div>
+                                );
+                              })}
+                            </>
+                          )
+                        : (detections || []).length > 0
+                          ? (detections || []).map((_, i) => (
+                              <div key={i} className="strip-item">
+                                #{i + 1}
+                              </div>
+                            ))
+                          : (
+                              <div className="strip-item muted">Объекты появятся после разметки</div>
+                            )}
                     </div>
                   </div>
                 </div>
