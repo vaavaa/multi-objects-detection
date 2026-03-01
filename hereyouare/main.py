@@ -471,6 +471,26 @@ async def _call_yolo_base64(
     return out
 
 
+def _merge_v1_v2_detections(
+    qwen_detections: List[Dict[str, Any]],
+    yolo_detections: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Объединяет детекции v1 (Qwen) и v2 (YOLO).
+    Для классов, присутствующих в v2, берём координаты из v2.
+    Классы, которые YOLO не распознал, добавляем из v1 с координатами Qwen.
+    """
+    labels_in_v2 = {d.get("label", "").strip() for d in yolo_detections if d.get("label")}
+    # Сначала все детекции YOLO (приоритет координат v2)
+    merged = list(yolo_detections)
+    # Добавляем из Qwen все объекты, чей класс не распознан YOLO (может быть несколько боксов на класс)
+    for d in qwen_detections or []:
+        label = (d.get("label") or "").strip()
+        if label and label not in labels_in_v2:
+            merged.append(d)
+    return merged
+
+
 async def _run_async_job(
     job_id: str,
     img_bytes: bytes,
@@ -516,13 +536,12 @@ async def _run_async_job(
         logger.info("Async job %s: calling YOLO with class_names=%s", job_id, class_names)
         yolo_detections = await _call_yolo_base64(prepared, class_names, w, h)
         logger.info(
-            "Async job %s: YOLO returned %d detections; v2 will use %s",
+            "Async job %s: YOLO returned %d detections; v2 = merge(v1, yolo)",
             job_id,
             len(yolo_detections),
-            "yolo" if yolo_detections else "qwen (yolo empty)",
         )
-        # Финальный ответ — координаты от YOLO (version v2); если YOLO пусто — оставляем от Qwen
-        detections = yolo_detections if yolo_detections else qwen_detections
+        # Финальный ответ v2: для классов из YOLO — координаты YOLO; остальные классы дополняем из v1 (Qwen)
+        detections = _merge_v1_v2_detections(qwen_detections, yolo_detections)
         result = {
             "status": "done",
             "version": "v2",
