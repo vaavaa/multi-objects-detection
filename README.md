@@ -37,6 +37,10 @@ docker exec -it ollama ollama pull qwen2.5vl:7b-q4_K_M
 
 FastAPI service that detects physical objects in images using an Ollama vision model (e.g. **qwen2.5vl**). Images are resized (max side 1024 px), sent to Ollama with a structured prompt, and the response is parsed into bounding boxes.
 
+Для интерактивной работы с детекцией доступно **веб-приложение HereYouAre UI** (React): загрузка изображения, отображение рамок и миниатюр обнаруженных объектов. Пример интерфейса:
+
+![Пользовательский интерфейс HereYouAre UI](hereyouare-ui/ui_example.png)
+
 ### Endpoints
 
 | Method | Path | Description |
