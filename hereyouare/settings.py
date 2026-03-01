@@ -67,13 +67,8 @@ YOLO_BASE64_URL = os.environ.get(
 )
 YOLO_IOU_THRESHOLD = 0.5
 YOLO_SCORE_THRESHOLD = 0.2
-YOLO_MAX_NUM_DETECTIONS = 8
+YOLO_MAX_NUM_DETECTIONS = 15
 YOLO_ONLY_BBOXS = True  # only_bboxs=true в query
 YOLO_TIMEOUT_SEC = 60
 # Классы по умолчанию, если не переданы и не получены из Qwen
-YOLO_DEFAULT_CLASS_NAMES: List[str] = [
-    "headphones",
-    "keyboard",
-    "mouse",
-    "mousepad",
-]
+YOLO_DEFAULT_CLASS_NAMES: List[str] = []
