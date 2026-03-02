@@ -35,7 +35,7 @@ services:
       - OLLAMA_BASE_URL=http://ollama:11434
       # - WEBUI_SECRET_KEY=your_secret_key  # Раскомментируйте и задайте ключ для продакшена
       # Подключение tool time-ui (OpenAPI) — автоматически подхватывается в Settings > Connections
-      - 'TOOL_SERVER_CONNECTIONS=[{"type":"openapi","url":"http://time-ui:8000","spec_type":"url","spec":"","path":"openapi.json","auth_type":"none","key":"","config":{"enable":true},"info":{"id":"time-ui","name":"Time Tool","description":"Secure Time Utilities API: UTC/local time, formatting, timezone conversion."}}]'
+      - 'TOOL_SERVER_CONNECTIONS=[{"type":"openapi","url":"http://192.168.1.114:8081","spec_type":"url","spec":"","path":"openapi.json","auth_type":"none","key":"","config":{"enable":true},"info":{"id":"time-ui","name":"Time Tool","description":"Secure Time Utilities API: UTC/local time, formatting, timezone conversion."}}]'
     # host.docker.internal — доступ к localhost хоста (tool-серверы, API, функции на хосте)
     extra_hosts:
       - host.docker.internal:host-gateway
@@ -51,8 +51,13 @@ services:
       context: ./time-ui
       dockerfile: Dockerfile
     container_name: time-ui
-    expose:
-      - "8081"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      # Системная зона контейнера (для datetime.now(), /get_current_local_time). Стандартная переменная — TZ.
+      - TZ=Asia/Almaty
+    ports:
+      - "8081:8081"
     restart: unless-stopped
 
   redis:
