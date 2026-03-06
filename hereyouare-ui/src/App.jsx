@@ -11,6 +11,9 @@ const HIGHLIGHT_BLINK_CYCLE_MS = 600; // один цикл: 0.6 с (0.3 с 100%�
 const HIGHLIGHT_BLINK_HALF_MS = 300;
 const HIGHLIGHT_BLINK_MIN = 0.2;
 const HIGHLIGHT_STROKE_MUL = 1.5;
+const BASE_STROKE_MUL = 2;
+const GLOW_ALPHA = 0.6;
+const GLOW_LIGHTEN = 0.45;
 
 const DEBUG_DRAW = false; // подробные логи отрисовки и опроса (отключить в проде)
 
@@ -34,11 +37,14 @@ export default function App() {
   const v2PayloadRef = useRef(null);
   const [v2Received, setV2Received] = useState(0);
   const v1AnimationStartedRef = useRef(false);
+  const currentJobIdRef = useRef(null); // актуальный job: ответы опроса для другого job игнорируем
 
   const onFile = useCallback((e) => {
     const f = e.target.files?.[0];
     if (!f) return;
+    currentJobIdRef.current = null; // сразу помечаем, что старый job не актуален (игнорировать запоздавшие ответы опроса)
     setFile(f);
+    if (preview) URL.revokeObjectURL(preview); // освобождаем старый blob URL
     setPreview(URL.createObjectURL(f));
     setJobId(null);
     setDetections([]);
@@ -47,9 +53,15 @@ export default function App() {
     setCropUrls([]);
     setSelectedDetectionIndex(null);
     v1AnimationStartedRef.current = false;
+    v2PayloadRef.current = null;
+    if (v2TransitionRef.current?.rafId) {
+      cancelAnimationFrame(v2TransitionRef.current.rafId);
+    }
+    v2TransitionRef.current = null;
+    setV2Received(0);
     setStatus('idle');
     setError(null);
-  }, []);
+  }, [preview]);
 
   const startJob = useCallback(async () => {
     if (!file) return;
@@ -81,13 +93,18 @@ export default function App() {
   // Опрос не прекращаем после v1 — ждём v2 (status === 'done'); только v2 завершает задачу
   useEffect(() => {
     if (!jobId || status !== 'processing') return;
+    currentJobIdRef.current = jobId;
     log('poll: start', { jobId });
     const t = setInterval(async () => {
+      const pollingFor = jobId; // замыкание: для какого job этот опрос
       try {
-        const r = await fetch(`${API_BASE}/v1/job/${jobId}`);
+        const r = await fetch(`${API_BASE}/v1/job/${pollingFor}`);
+        if (currentJobIdRef.current !== pollingFor) return; // пользователь уже загрузил новую картинку — не применять результат
         if (!r.ok) return;
         const data = await r.json();
+        if (currentJobIdRef.current !== pollingFor) return;
         if (data.status === 'done') {
+          if (currentJobIdRef.current !== pollingFor) return;
           const v2Detections = data.detections || [];
           const v2Image =
             data.image && typeof data.image.width === 'number' && typeof data.image.height === 'number'
@@ -99,12 +116,14 @@ export default function App() {
           return;
         }
         if (data.status === 'failed') {
+          if (currentJobIdRef.current !== pollingFor) return;
           log('poll: failed', data.error);
           setError(data.error || 'Job failed');
           setStatus('idle');
           return;
         }
         if (data.status === 'processing' && (data.version === 'v1' || (data.detections && data.detections.length > 0))) {
+          if (currentJobIdRef.current !== pollingFor) return;
           const list = data.detections || [];
           if (list.length > 0) {
             log('poll: v1 received', { detectionsCount: list.length, version: data.version });
@@ -118,6 +137,7 @@ export default function App() {
           }
         }
       } catch (e) {
+        if (currentJobIdRef.current !== pollingFor) return;
         log('poll: error', e);
         setError(String(e));
         setStatus('idle');
@@ -129,34 +149,99 @@ export default function App() {
     };
   }, [jobId, status]);
 
+  const parseColor = (input) => {
+    const s = String(input || '').trim();
+    // rgb()/rgba()
+    const m = s.match(/^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+)\s*)?\)$/i);
+    if (m) {
+      const r = Math.max(0, Math.min(255, Number(m[1] ?? 0)));
+      const g = Math.max(0, Math.min(255, Number(m[2] ?? 0)));
+      const b = Math.max(0, Math.min(255, Number(m[3] ?? 0)));
+      const a = m[4] == null ? 1 : Math.max(0, Math.min(1, Number(m[4])));
+      return { r, g, b, a };
+    }
+    // #rgb / #rrggbb
+    const h = s.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+    if (h) {
+      const hex = h[1].toLowerCase();
+      if (hex.length === 3) {
+        const r = parseInt(hex[0] + hex[0], 16);
+        const g = parseInt(hex[1] + hex[1], 16);
+        const b = parseInt(hex[2] + hex[2], 16);
+        return { r, g, b, a: 1 };
+      }
+      const r = parseInt(hex.slice(0, 2), 16);
+      const g = parseInt(hex.slice(2, 4), 16);
+      const b = parseInt(hex.slice(4, 6), 16);
+      return { r, g, b, a: 1 };
+    }
+    // fallback (неизвестный формат) — не ломаем отрисовку
+    return { r: 255, g: 255, b: 255, a: 1 };
+  };
+
+  const lighten = ({ r, g, b }, k) => {
+    const kk = Math.max(0, Math.min(1, Number(k) || 0));
+    const rr = Math.round(r + (255 - r) * kk);
+    const gg = Math.round(g + (255 - g) * kk);
+    const bb = Math.round(b + (255 - b) * kk);
+    return { r: rr, g: gg, b: bb };
+  };
+
   const drawCorner = (ctx, x1, y1, x2, y2, color, lineWidth, opacity = 1) => {
     const w = x2 - x1;
     const h = y2 - y1;
     const segW = Math.max(1, Math.floor(w * 0.15));
     const segH = Math.max(1, Math.floor(h * 0.15));
+
+    const { r, g, b, a: baseA } = parseColor(color);
+    const glowRGB = lighten({ r, g, b }, GLOW_LIGHTEN);
+    const mainAlpha = Math.max(0, Math.min(1, opacity)) * baseA;
+    const glowAlpha = Math.max(0, Math.min(1, opacity)) * baseA * GLOW_ALPHA;
+
+    const drawPath = () => {
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x1 + segW, y1);
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x1, y1 + segH);
+      ctx.moveTo(x2 - segW, y1);
+      ctx.lineTo(x2, y1);
+      ctx.moveTo(x2, y1);
+      ctx.lineTo(x2, y1 + segH);
+      ctx.moveTo(x2, y2 - segH);
+      ctx.lineTo(x2, y2);
+      ctx.moveTo(x2, y2);
+      ctx.lineTo(x2 - segW, y2);
+      ctx.moveTo(x1, y2 - segH);
+      ctx.lineTo(x1, y2);
+      ctx.moveTo(x1, y2);
+      ctx.lineTo(x1 + segW, y2);
+    };
+
     ctx.save();
-    if (opacity < 1) ctx.globalAlpha = opacity;
-    ctx.strokeStyle = color;
-    ctx.lineWidth = lineWidth;
     ctx.setLineDash([]);
-    ctx.beginPath();
-    ctx.moveTo(x1, y1);
-    ctx.lineTo(x1 + segW, y1);
-    ctx.moveTo(x1, y1);
-    ctx.lineTo(x1, y1 + segH);
-    ctx.moveTo(x2 - segW, y1);
-    ctx.lineTo(x2, y1);
-    ctx.moveTo(x2, y1);
-    ctx.lineTo(x2, y1 + segH);
-    ctx.moveTo(x2, y2 - segH);
-    ctx.lineTo(x2, y2);
-    ctx.moveTo(x2, y2);
-    ctx.lineTo(x2 - segW, y2);
-    ctx.moveTo(x1, y2 - segH);
-    ctx.lineTo(x1, y2);
-    ctx.moveTo(x1, y2);
-    ctx.lineTo(x1 + segW, y2);
-    ctx.stroke();
+
+    // 1) Свечение: шире основной линии так, чтобы ореол был толщиной lineWidth/2 вокруг
+    if (glowAlpha > 0) {
+      ctx.globalAlpha = glowAlpha;
+      ctx.strokeStyle = `rgb(${glowRGB.r},${glowRGB.g},${glowRGB.b})`;
+      ctx.lineWidth = lineWidth * 2;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      drawPath();
+      ctx.stroke();
+    }
+
+    // 2) Основная линия поверх
+    if (mainAlpha > 0) {
+      ctx.globalAlpha = mainAlpha;
+      ctx.strokeStyle = `rgb(${r},${g},${b})`;
+      ctx.lineWidth = lineWidth;
+      ctx.lineCap = 'square';
+      ctx.lineJoin = 'miter';
+      drawPath();
+      ctx.stroke();
+    }
     ctx.restore();
   };
 
@@ -290,7 +375,7 @@ export default function App() {
     const scaleX = imgW / apiW;
     const scaleY = imgH / apiH;
 
-    const baseLineW = Math.max(2, Math.min(imgW, imgH) / 400);
+    const baseLineW = Math.max(2, Math.min(imgW, imgH) / 400) * BASE_STROKE_MUL;
     const lineW = baseLineW * 1.5;
 
     const drawBase = () => {

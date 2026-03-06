@@ -480,14 +480,22 @@ def _merge_v1_v2_detections(
     Для классов, присутствующих в v2, берём координаты из v2.
     Классы, которые YOLO не распознал, добавляем из v1 с координатами Qwen.
     """
+    # Новая логика: при наличии V2 используем только YOLO
+    #if yolo_detections:
+    #    return list(yolo_detections)
+    #return list(qwen_detections or [])
+
+    # --- старая логика (мерж v1 + v2): закомментирована ---
+    # """
+    # """
     labels_in_v2 = {d.get("label", "").strip() for d in yolo_detections if d.get("label")}
-    # Сначала все детекции YOLO (приоритет координат v2)
+     # Сначала все детекции YOLO (приоритет координат v2)
     merged = list(yolo_detections)
-    # Добавляем из Qwen все объекты, чей класс не распознан YOLO (может быть несколько боксов на класс)
+     # Добавляем из Qwen все объекты, чей класс не распознан YOLO (может быть несколько боксов на класс)
     for d in qwen_detections or []:
-        label = (d.get("label") or "").strip()
-        if label and label not in labels_in_v2:
-            merged.append(d)
+         label = (d.get("label") or "").strip()
+         if label and label not in labels_in_v2:
+             merged.append(d)
     return merged
 
 
