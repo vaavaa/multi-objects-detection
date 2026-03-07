@@ -2,9 +2,9 @@
 
 Docker Compose stack that runs **OpenWebUI** with **Ollama** (GPU-backed) and custom tool services: **Time UI** (time/timezone utilities) and **HereYouAre** (vision-based object detection).
 
-![Процесс распознавания объектов на изображении — HereYouAre](detection-from-image.gif)
+![Object detection on image — HereYouAre](detection-from-image.gif)
 
-*Загрузка картинки → обработка → рамки и метки (Mouse, Keyboard, Headphones, Deskmat).*
+*Upload image → processing → bounding boxes and labels (Mouse, Keyboard, Headphones, Deskmat).*
 
 ## Overview
 
