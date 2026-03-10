@@ -1,15 +1,226 @@
-# OpenWebUI + Ollama (GPU, локальные tools/functions)
+# OpenWebUI + Ollama + Langfuse (GPU, локальные tools/functions)
 # Требуется: NVIDIA Container Toolkit (nvidia-ctk) для GPU
+# Langfuse: http://localhost:3100 — задайте NEXTAUTH_SECRET, SALT, ENCRYPTION_KEY, пароли в .env
 
 services:
+  # --- Общая инфраструктура (OpenWebUI + Langfuse) ---
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    command: >
+      redis-server
+      --requirepass ${REDIS_AUTH:-myredissecret}
+      --maxmemory-policy noeviction
+    ports:
+      - "127.0.0.1:6379:6379"
+    environment:
+      TZ: ${TZ:-Asia/Almaty}
+    volumes:
+      - redis-data:/data
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_AUTH:-myredissecret}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  postgres:
+    image: docker.io/postgres:${POSTGRES_VERSION:-17}
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      TZ: ${TZ:-Asia/Almaty}
+      PGTZ: ${TZ:-Asia/Almaty}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server
+    container_name: clickhouse
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      TZ: ${TZ:-Asia/Almaty}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    ports:
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+
+  minio:
+    image: cgr.dev/chainguard/minio
+    container_name: minio
+    restart: unless-stopped
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret}
+      TZ: ${TZ:-Asia/Almaty}
+    ports:
+      - "9090:9000"
+      - "127.0.0.1:9091:9001"
+    volumes:
+      - langfuse_minio_data:/data
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 1s
+      timeout: 5s
+      retries: 5
+      start_period: 1s
+
+  # --- Langfuse (observability) ---
+
+  langfuse-worker:
+    image: docker.io/langfuse/langfuse-worker:3
+    container_name: langfuse-worker
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio: { condition: service_healthy }
+    ports:
+      - "127.0.0.1:3030:3030"
+    environment:
+      TZ: ${TZ:-Asia/Almaty}
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3100}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-changeme}
+      SALT: ${SALT:-changeme}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-changeme}
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-postgres}
+      CLICKHOUSE_MIGRATION_URL: ${CLICKHOUSE_MIGRATION_URL:-clickhouse://clickhouse:9000}
+      CLICKHOUSE_URL: ${CLICKHOUSE_URL:-http://clickhouse:8123}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_CLUSTER_ENABLED: ${CLICKHOUSE_CLUSTER_ENABLED:-false}
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_AUTH: ${REDIS_AUTH:-myredissecret}
+      REDIS_TLS_ENABLED: ${REDIS_TLS_ENABLED:-false}
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse}
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_EVENT_UPLOAD_REGION:-auto}
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID:-minio}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY:-miniosecret}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: ${LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT:-http://minio:9000}
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE:-true}
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: ${LANGFUSE_S3_EVENT_UPLOAD_PREFIX:-events/}
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-langfuse}
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${LANGFUSE_S3_MEDIA_UPLOAD_REGION:-auto}
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID:-minio}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY:-miniosecret}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT:-http://localhost:9090}
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE:-true}
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: ${LANGFUSE_S3_MEDIA_UPLOAD_PREFIX:-media/}
+      TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-true}
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: ${LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES:-false}
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-}
+      SMTP_CONNECTION_URL: ${SMTP_CONNECTION_URL:-}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+
+  langfuse-web:
+    image: docker.io/langfuse/langfuse:3
+    container_name: langfuse-web
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio: { condition: service_healthy }
+    ports:
+      - "3100:3000"
+    environment:
+      TZ: ${TZ:-Europe/Moscow}
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3100}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-changeme}
+      SALT: ${SALT:-changeme}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-changeme}
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-postgres}
+      CLICKHOUSE_MIGRATION_URL: ${CLICKHOUSE_MIGRATION_URL:-clickhouse://clickhouse:9000}
+      CLICKHOUSE_URL: ${CLICKHOUSE_URL:-http://clickhouse:8123}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_CLUSTER_ENABLED: ${CLICKHOUSE_CLUSTER_ENABLED:-false}
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_AUTH: ${REDIS_AUTH:-myredissecret}
+      REDIS_TLS_ENABLED: ${REDIS_TLS_ENABLED:-false}
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse}
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_EVENT_UPLOAD_REGION:-auto}
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID:-minio}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY:-miniosecret}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: ${LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT:-http://minio:9000}
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE:-true}
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: ${LANGFUSE_S3_EVENT_UPLOAD_PREFIX:-events/}
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-langfuse}
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${LANGFUSE_S3_MEDIA_UPLOAD_REGION:-auto}
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID:-minio}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY:-miniosecret}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT:-http://localhost:9090}
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE:-true}
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: ${LANGFUSE_S3_MEDIA_UPLOAD_PREFIX:-media/}
+      TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-true}
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: ${LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES:-false}
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-}
+      SMTP_CONNECTION_URL: ${SMTP_CONNECTION_URL:-}
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+
+  # --- OpenWebUI + Ollama ---
+
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
+    environment:
+      TZ: ${TZ:-Asia/Almaty}
     volumes:
       - ollama:/root/.ollama
-      - ./ollama-images:/root/ollama-images  # загрузка картинок для анализа vision-моделями
+      - ./ollama-images:/root/ollama-images
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     ports:
-      - 127.0.0.1:11434:11434  # только localhost, если нужен доступ с хоста — уберите 127.0.0.1
+      - 127.0.0.1:11434:11434
     pull_policy: if_not_present
     tty: true
     restart: unless-stopped
@@ -26,17 +237,18 @@ services:
     container_name: open-webui
     volumes:
       - open-webui:/app/backend/data
-      # Вариант: данные на хосте (tools/functions правятся локально). Закомментируйте строку выше
-      # и раскомментируйте следующую, создайте папку: mkdir -p ./local-openwebui-data
-      # - ./local-openwebui-data:/app/backend/data
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     ports:
       - 3000:8080
     environment:
+      - TZ=${TZ:-Asia/Almaty}
       - OLLAMA_BASE_URL=http://ollama:11434
-      # - WEBUI_SECRET_KEY=your_secret_key  # Раскомментируйте и задайте ключ для продакшена
-      # Подключение tool time-ui (OpenAPI) — автоматически подхватывается в Settings > Connections
       - 'TOOL_SERVER_CONNECTIONS=[{"type":"openapi","url":"http://192.168.1.114:8081","spec_type":"url","spec":"","path":"openapi.json","auth_type":"none","key":"","config":{"enable":true},"info":{"id":"time-ui","name":"Time Tool","description":"Secure Time Utilities API: UTC/local time, formatting, timezone conversion."}}]'
-    # host.docker.internal — доступ к localhost хоста (tool-серверы, API, функции на хосте)
+      # Интеграция с Langfuse (раскомментируйте и задайте ключи из Langfuse Project Settings):
+      # - LANGFUSE_PUBLIC_KEY=pk-lf-...
+      # - LANGFUSE_SECRET_KEY=sk-lf-...
+      # - LANGFUSE_HOST=http://langfuse-web:3000
     extra_hosts:
       - host.docker.internal:host-gateway
     depends_on:
@@ -45,7 +257,6 @@ services:
     pull_policy: if_not_present
     restart: unless-stopped
 
-  # Tool для OpenWebUI: время, таймзоны, форматирование (OpenAPI)
   time-ui:
     build:
       context: ./time-ui
@@ -54,27 +265,14 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONDONTWRITEBYTECODE=1
-      # Системная зона контейнера (для datetime.now(), /get_current_local_time). Стандартная переменная — TZ.
-      - TZ=Asia/Almaty
+      - TZ=${TZ:-Asia/Almaty}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     ports:
       - "8081:8081"
     restart: unless-stopped
 
-  redis:
-    image: redis:7-alpine
-    container_name: redis
-    ports:
-      - "127.0.0.1:6379:6379"
-    volumes:
-      - redis-data:/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-
-  # Детекция объектов на изображении (vision через Ollama)
   hereyouare:
     build:
       context: ./hereyouare
@@ -83,27 +281,43 @@ services:
     ports:
       - "127.0.0.1:8082:8082"
     environment:
-      - REDIS_URL=redis://redis:6379/0
+      - TZ=${TZ:-Asia/Almaty}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5vl:7b-q4_K_M}
+      - REDIS_URL=redis://:${REDIS_AUTH:-myredissecret}@redis:6379/0
       - YOLO_BASE64_URL=http://192.168.1.114:8001/api/v1/yworld/base64
+      # Langfuse (Prompt Management + Tracing) для hereyouare
+      # Ключи берите в Langfuse UI → Project Settings → API Keys
+      - LANGFUSE_ENABLED=${LANGFUSE_ENABLED:-true}
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+      # Порт 3000 — внутренний порт контейнера langfuse-web (не 3100!)
+      - LANGFUSE_BASE_URL=${LANGFUSE_BASE_URL:-http://langfuse-web:3000}
+      - LANGFUSE_PROMPT_LABEL=${LANGFUSE_PROMPT_LABEL:-production}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     depends_on:
       ollama: { condition: service_started }
       redis: { condition: service_healthy }
     restart: unless-stopped
 
-  # UI для разметки объектов (hereyouare), прокси /v1 → hereyouare:8082
   hereyouare-ui:
     build:
       context: ./hereyouare-ui
       dockerfile: Dockerfile
     container_name: hereyouare-ui
+    environment:
+      TZ: ${TZ:-Asia/Almaty}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     ports:
       - "127.0.0.1:5173:80"
     depends_on:
       - hereyouare
     restart: unless-stopped
 
-  # Реверс-прокси для HTTPS (микрофон и т.п. на удалённых устройствах). Конфиг: ./nginx/conf.d
-  # Перед первым запуском создайте сертификаты: nginx/ssl/gen-selfsigned.sh (или см. nginx/ssl/README.txt)
+  # nginx (HTTPS) — раскомментируйте при необходимости
   #nginx:
   #  image: nginx:alpine
   #  container_name: nginx-openwebui
@@ -111,22 +325,17 @@ services:
   #    - 80:80
   #    - 443:443
   #  volumes:
-  #    # Конфиг в подключаемом volume — правьте на хосте
   #    - ./nginx/conf.d:/etc/nginx/conf.d:ro
   #    - ./nginx/ssl:/etc/nginx/ssl:ro
   #  depends_on:
   #    - openwebui
   #  restart: unless-stopped
 
-  # YOLO World — детекция по заданным классам (опционально, раскомментируйте при наличии образа)
-  # fastapi-yolo:
-  #   image: your-registry/fastapi-yolo:latest  # укажите образ
-  #   container_name: fastapi-yolo
-  #   ports:
-  #     - "127.0.0.1:8001:8001"
-  #   restart: unless-stopped
-
 volumes:
   ollama: {}
   open-webui: {}
   redis-data: {}
+  langfuse_postgres_data: {}
+  langfuse_clickhouse_data: {}
+  langfuse_clickhouse_logs: {}
+  langfuse_minio_data: {}

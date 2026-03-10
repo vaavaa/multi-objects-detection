@@ -21,6 +21,7 @@ from PIL import Image, ImageDraw, ImageFont
 from redis.asyncio import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 
+from langfuse_runtime import get_prompt_bundle
 from settings import (
     CACHE_TTL_SEC,
     FORMAT_SCHEMA,
@@ -330,29 +331,83 @@ async def _run_detection(raw: bytes) -> tuple[bytes, int, int, List[Dict[str, An
             raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
 
         img_b64 = base64.b64encode(prepared).decode("utf-8")
+        img_hash = _image_hash(prepared)
+
+        bundle = get_prompt_bundle(
+            model=MODEL,
+            fallback_prompt=PROMPT,
+            fallback_schema=FORMAT_SCHEMA,
+            fallback_temperature=OLLAMA_TEMPERATURE,
+        )
+
         payload = {
             "model": MODEL,
-            "prompt": PROMPT,
+            "prompt": bundle.text,
             "images": [img_b64],
             "stream": False,
-            "format": FORMAT_SCHEMA,
-            "options": {"temperature": OLLAMA_TEMPERATURE},
+            "format": bundle.format_schema or FORMAT_SCHEMA,
+            "options": {"temperature": bundle.temperature if bundle.temperature is not None else OLLAMA_TEMPERATURE},
         }
 
-        async with _OLLAMA_SEM:
-            async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SEC) as client:
-                r = await client.post(OLLAMA_URL, json=payload)
-                if r.status_code != 200:
-                    raise HTTPException(status_code=502, detail=f"Ollama error: {r.text}")
-
-        data = r.json()
-        model_text = data.get("response", "")
-        logger.info("Ollama model response (before parse): %s", model_text)
-
         try:
-            parsed = _safe_json_parse(model_text)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Model did not return JSON: {e}")
+            # Langfuse tracing (best-effort, no hard dependency)
+            try:
+                from langfuse import get_client  # type: ignore
+
+                lf = get_client()
+            except Exception:
+                lf = None
+
+            if lf is None:
+                async with _OLLAMA_SEM:
+                    async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SEC) as client:
+                        r = await client.post(OLLAMA_URL, json=payload)
+            else:
+                with lf.start_as_current_observation(
+                    as_type="span",
+                    name="hereyouare.detect",
+                    input={
+                        "model": MODEL,
+                        "iteration": iteration,
+                        "image": {"width": w, "height": h, "hash": img_hash},
+                        "prompt_source": bundle.source,
+                    },
+                ):
+                    with lf.start_as_current_observation(
+                        as_type="generation",
+                        name="ollama.generate",
+                        model=MODEL,
+                        prompt=bundle.langfuse_prompt,
+                        input={
+                            "ollama_url": OLLAMA_URL,
+                            "options": payload.get("options"),
+                            "format": payload.get("format"),
+                        },
+                    ) as generation:
+                        async with _OLLAMA_SEM:
+                            async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SEC) as client:
+                                r = await client.post(OLLAMA_URL, json=payload)
+                        if getattr(r, "status_code", 0) == 200:
+                            try:
+                                body = r.json()
+                                generation.update(output={"raw": body.get("response", "")})
+                            except Exception:
+                                pass
+
+            if r.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Ollama error: {r.text}")
+
+            data = r.json()
+            model_text = data.get("response", "")
+            logger.info("Ollama model response (before parse): %s", model_text)
+
+            try:
+                parsed = _safe_json_parse(model_text)
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"Model did not return JSON: {e}")
+
+        except Exception:
+            raise
 
         if isinstance(parsed, list):
             raw_detections = parsed
