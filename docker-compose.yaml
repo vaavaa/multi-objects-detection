@@ -254,6 +254,7 @@ services:
     depends_on:
       - ollama
       - time-ui
+      - picture-ui
     pull_policy: if_not_present
     restart: unless-stopped
 
@@ -271,6 +272,22 @@ services:
       - /etc/timezone:/etc/timezone:ro
     ports:
       - "8081:8081"
+    restart: unless-stopped
+
+  picture-ui:
+    build:
+      context: ./picture-ui
+      dockerfile: Dockerfile
+    container_name: picture-ui
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      - TZ=${TZ:-Asia/Almaty}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    ports:
+      - "8083:8083"
     restart: unless-stopped
 
   hereyouare:
