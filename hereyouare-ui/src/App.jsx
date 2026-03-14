@@ -254,6 +254,45 @@ export default function App() {
   const highlightBlinkRef = useRef({ startTime: 0, rafId: 0, done: true });
   const [stripHeightPx, setStripHeightPx] = useState(0);
 
+  // Клик по canvas: попадание в bbox → выбор элемента (та же анимация, что при клике по strip)
+  const handleCanvasClick = useCallback(
+    (e) => {
+      if (status !== 'done' || !detections?.length) return;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const { w: imgW, h: imgH } = renderRef.current;
+      if (!imgW || !imgH) return;
+      const rect = canvas.getBoundingClientRect();
+      const displayX = e.clientX - rect.left;
+      const displayY = e.clientY - rect.top;
+      const imageX = displayX * (imgW / rect.width);
+      const imageY = displayY * (imgH / rect.height);
+      const apiW = resultImageSize?.w > 0 ? resultImageSize.w : imgW;
+      const apiH = resultImageSize?.h > 0 ? resultImageSize.h : imgH;
+      const sx = imgW / apiW;
+      const sy = imgH / apiH;
+      const hits = [];
+      for (let i = 0; i < detections.length; i++) {
+        const p = detections[i].position || [];
+        const x1 = (p[0] ?? 0) * sx;
+        const y1 = (p[1] ?? 0) * sy;
+        const x2 = (p[2] ?? 0) * sx;
+        const y2 = (p[3] ?? 0) * sy;
+        if (x2 - x1 < 2 || y2 - y1 < 2) continue;
+        if (imageX >= x1 && imageX <= x2 && imageY >= y1 && imageY <= y2) {
+          hits.push({ index: i, area: (x2 - x1) * (y2 - y1) });
+        }
+      }
+      if (hits.length === 0) {
+        setSelectedDetectionIndex(null);
+        return;
+      }
+      hits.sort((a, b) => a.area - b.area);
+      setSelectedDetectionIndex(hits[0].index);
+    },
+    [status, detections, resultImageSize]
+  );
+
   // Индексы в detections, отсортированные по (x1,y1) — порядок плиток в strip совпадает с рамками на canvas
   const sortedIndicesForStrip = useMemo(() => {
     if (!detections?.length || resultVersion !== 'v2') return [];
@@ -712,7 +751,13 @@ export default function App() {
             <div className="media-column">
               <div className="media-stage">
                 <div className="media-frame">
-                  <canvas ref={canvasRef} className="preview-canvas" />
+                  <canvas
+                    ref={canvasRef}
+                    className={`preview-canvas ${status === 'done' && detections?.length > 0 ? 'preview-canvas--clickable' : ''}`}
+                    onClick={handleCanvasClick}
+                    role={status === 'done' && detections?.length > 0 ? 'button' : undefined}
+                    aria-label={status === 'done' && detections?.length > 0 ? 'Выбор объекта по клику' : undefined}
+                  />
 
                   {/* 3) Нижняя область: первая плитка — вся картинка (по умолчанию выделена), далее кропы по bbox v2 */}
                   <div className="strip" style={{ height: stripHeightPx ? `${stripHeightPx}px` : undefined }}>
