@@ -8,7 +8,8 @@ from typing import Any, Dict, List
 
 # Ollama API
 OLLAMA_URL = "http://ollama:11434/api/generate"  # в docker-compose это имя сервиса
-MODEL = os.environ.get("OLLAMA_MODEL", "qwen3-vl:8b-instruct-q8_0")
+MODEL = os.environ.get("OLLAMA_MODEL", "qwen3-vl:8b-instruct-q8_0") # qwen2.5vl:7b-q8_0
+#MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5vl:7b-q8_0")
 
 # Ограничьте параллельные запросы к GPU (иначе очередь внутри Ollama и рост latency)
 OLLAMA_CONCURRENCY = 1

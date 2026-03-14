@@ -769,7 +769,7 @@ export default function App() {
                                 role="button"
                                 tabIndex={0}
                                 className={`strip-item strip-item--crop strip-item--full ${selectedDetectionIndex === null ? 'strip-item--selected' : ''}`}
-                                style={{ height: stripHeightPx > 0 ? stripHeightPx - 8 : undefined }}
+                                style={{ height: stripHeightPx > 0 ? stripHeightPx - 24 : undefined }}
                                 onClick={() => setSelectedDetectionIndex(null)}
                                 onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') setSelectedDetectionIndex(null); }}
                               >
@@ -784,7 +784,7 @@ export default function App() {
                                     role="button"
                                     tabIndex={0}
                                     className={`strip-item strip-item--crop ${selectedDetectionIndex === detIndex ? 'strip-item--selected' : ''}`}
-                                    style={{ height: stripHeightPx > 0 ? stripHeightPx - 8 : undefined }}
+                                    style={{ height: stripHeightPx > 0 ? stripHeightPx - 24 : undefined }}
                                     onClick={() => setSelectedDetectionIndex(detIndex)}
                                     onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') setSelectedDetectionIndex(detIndex); }}
                                   >
