@@ -253,6 +253,15 @@ export default function App() {
   const v2TransitionRef = useRef(null); // { phase: 'fadeOut'|'fadeIn', oldDetections, newDetections, imageSize, startTime, rafId }
   const highlightBlinkRef = useRef({ startTime: 0, rafId: 0, done: true });
   const [stripHeightPx, setStripHeightPx] = useState(0);
+  const stripItemRefs = useRef({}); // 'full' | detIndex → DOM element для scrollIntoView
+
+  // Подскролл ленты к выбранной плитке при смене выбора
+  useEffect(() => {
+    if (status !== 'done' || !cropUrls?.length) return;
+    const key = selectedDetectionIndex === null ? 'full' : selectedDetectionIndex;
+    const el = stripItemRefs.current[key];
+    el?.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' });
+  }, [status, cropUrls?.length, selectedDetectionIndex]);
 
   // Клик по canvas: попадание в bbox → выбор элемента (та же анимация, что при клике по strip)
   const handleCanvasClick = useCallback(
@@ -312,6 +321,29 @@ export default function App() {
   const sortedDetectionsForStrip = useMemo(
     () => sortedIndicesForStrip.map((i) => detections[i]),
     [detections, sortedIndicesForStrip]
+  );
+
+  // Стрелки влево/вправо в ленте: сдвиг выбора на соседний элемент
+  const handleStripKeyDown = useCallback(
+    (e, isFullTile) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      if (!sortedIndicesForStrip.length) return;
+      e.preventDefault();
+      if (e.key === 'ArrowRight') {
+        if (isFullTile) {
+          setSelectedDetectionIndex(sortedIndicesForStrip[0]);
+        } else {
+          const i = sortedIndicesForStrip.indexOf(selectedDetectionIndex);
+          if (i < sortedIndicesForStrip.length - 1) setSelectedDetectionIndex(sortedIndicesForStrip[i + 1]);
+        }
+      } else {
+        if (isFullTile) return;
+        const i = sortedIndicesForStrip.indexOf(selectedDetectionIndex);
+        if (i > 0) setSelectedDetectionIndex(sortedIndicesForStrip[i - 1]);
+        else setSelectedDetectionIndex(null);
+      }
+    },
+    [sortedIndicesForStrip, selectedDetectionIndex]
   );
 
   // Генерация кропов по bbox для strip после v2
@@ -766,12 +798,16 @@ export default function App() {
                         ? (
                             <>
                               <div
+                                ref={(el) => { stripItemRefs.current['full'] = el; }}
                                 role="button"
                                 tabIndex={0}
                                 className={`strip-item strip-item--crop strip-item--full ${selectedDetectionIndex === null ? 'strip-item--selected' : ''}`}
                                 style={{ height: stripHeightPx > 0 ? stripHeightPx - 24 : undefined }}
                                 onClick={() => setSelectedDetectionIndex(null)}
-                                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') setSelectedDetectionIndex(null); }}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter' || e.key === ' ') setSelectedDetectionIndex(null);
+                                  else handleStripKeyDown(e, true);
+                                }}
                               >
                                 <span className="strip-crop-label">Вся картинка</span>
                                 <img src={preview} alt="" className="strip-crop-img" />
@@ -781,12 +817,16 @@ export default function App() {
                                 return (
                                   <div
                                     key={detIndex}
+                                    ref={(el) => { stripItemRefs.current[detIndex] = el; }}
                                     role="button"
                                     tabIndex={0}
                                     className={`strip-item strip-item--crop ${selectedDetectionIndex === detIndex ? 'strip-item--selected' : ''}`}
                                     style={{ height: stripHeightPx > 0 ? stripHeightPx - 24 : undefined }}
                                     onClick={() => setSelectedDetectionIndex(detIndex)}
-                                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') setSelectedDetectionIndex(detIndex); }}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter' || e.key === ' ') setSelectedDetectionIndex(detIndex);
+                                      else handleStripKeyDown(e, false);
+                                    }}
                                   >
                                     <span className="strip-crop-label">{d.label ?? d.label_name ?? ''}</span>
                                     <img src={cropUrls[i]} alt="" className="strip-crop-img" />

@@ -93,7 +93,7 @@ body {
   cursor: pointer;
 }
 
-/* Лента: ширина = ширине canvas, горизонтальный скролл */
+/* Лента: ширина = ширине canvas, горизонтальный скролл + привязка к плиткам */
 .strip {
   width: 100%;
   overflow-x: auto;
@@ -105,6 +105,7 @@ body {
   background: rgba(0, 0, 0, 0.12);
   scrollbar-color: rgba(80, 90, 110, 0.6) #1a1a2e;
   scrollbar-width: thin;
+  scroll-snap-type: x mandatory;
 }
 
 /* Полоса прокрутки в тон фону страницы (#1a1a2e) */
@@ -142,6 +143,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
+  scroll-snap-align: start;
 }
 
 .strip-item--crop {
@@ -154,6 +156,11 @@ body {
   flex-direction: column;
   align-items: center;
   cursor: pointer;
+}
+
+.strip-item--crop:focus-visible {
+  outline: 2px solid #4a9;
+  outline-offset: 2px;
 }
 
 .strip-item--crop:hover {
