@@ -323,24 +323,29 @@ export default function App() {
     [detections, sortedIndicesForStrip]
   );
 
-  // Стрелки влево/вправо в ленте: сдвиг выбора на соседний элемент
+  // Стрелки влево/вправо в ленте: сдвиг выбора и фокуса на соседний элемент
   const handleStripKeyDown = useCallback(
     (e, isFullTile) => {
       if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
       if (!sortedIndicesForStrip.length) return;
       e.preventDefault();
+      let next = null;
       if (e.key === 'ArrowRight') {
         if (isFullTile) {
-          setSelectedDetectionIndex(sortedIndicesForStrip[0]);
+          next = sortedIndicesForStrip[0];
         } else {
           const i = sortedIndicesForStrip.indexOf(selectedDetectionIndex);
-          if (i < sortedIndicesForStrip.length - 1) setSelectedDetectionIndex(sortedIndicesForStrip[i + 1]);
+          next = i < sortedIndicesForStrip.length - 1 ? sortedIndicesForStrip[i + 1] : selectedDetectionIndex;
         }
       } else {
         if (isFullTile) return;
         const i = sortedIndicesForStrip.indexOf(selectedDetectionIndex);
-        if (i > 0) setSelectedDetectionIndex(sortedIndicesForStrip[i - 1]);
-        else setSelectedDetectionIndex(null);
+        next = i > 0 ? sortedIndicesForStrip[i - 1] : null;
+      }
+      if (next !== selectedDetectionIndex) {
+        setSelectedDetectionIndex(next);
+        const refKey = next === null ? 'full' : next;
+        stripItemRefs.current[refKey]?.focus();
       }
     },
     [sortedIndicesForStrip, selectedDetectionIndex]
