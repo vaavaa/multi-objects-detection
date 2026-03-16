@@ -8,8 +8,8 @@ from typing import Any, Dict, List
 
 # Ollama API
 OLLAMA_URL = "http://ollama:11434/api/generate"  # в docker-compose это имя сервиса
-MODEL = os.environ.get("OLLAMA_MODEL", "qwen3-vl:8b-instruct-q8_0") # qwen2.5vl:7b-q8_0
-#MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5vl:7b-q8_0")
+# MODEL = os.environ.get("OLLAMA_MODEL", "qwen3-vl:8b-instruct-q8_0") # qwen2.5vl:7b-q8_0
+MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5vl:7b-q8_0")
 
 # Ограничьте параллельные запросы к GPU (иначе очередь внутри Ollama и рост latency)
 OLLAMA_CONCURRENCY = 1
@@ -73,3 +73,11 @@ YOLO_ONLY_BBOXS = True  # only_bboxs=true в query
 YOLO_TIMEOUT_SEC = 60
 # Классы по умолчанию, если не переданы и не получены из Qwen
 YOLO_DEFAULT_CLASS_NAMES: List[str] = []
+
+# Режим объединения детекций v1 (Qwen) и v2 (YOLO):
+# True  - объединять боксы (YOLO + Qwen-добавки по недостающим классам)
+# False - использовать только детекции YOLO (если они есть)
+MERGE_QWEN_YOLO_DETECTIONS = os.environ.get(
+    "MERGE_QWEN_YOLO_DETECTIONS",
+    "true",
+).lower() in ("1", "true", "yes")
