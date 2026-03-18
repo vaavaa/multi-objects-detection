@@ -6,7 +6,7 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import orjson
 import xxhash
@@ -28,6 +28,11 @@ from settings import (
     IMAGE_JPEG_QUALITY,
     IMAGE_MAX_SIDE,
     JOB_RESULT_TTL_SEC,
+    LABEL_CANON_CACHE_TTL_SEC,
+    LABEL_CANON_MIN_CONFIDENCE,
+    LABEL_CANON_MODEL,
+    LABEL_CANON_TEMPERATURE,
+    LABEL_CANON_TIMEOUT_SEC,
     V2_DELAY_MS,
     MERGE_QWEN_YOLO_DETECTIONS,
     MODEL,
@@ -53,6 +58,180 @@ from settings import (
 )
 
 _OLLAMA_SEM = asyncio.Semaphore(OLLAMA_CONCURRENCY)
+
+# --- label synonym cache (key -> (synonym_label, confidence, expires_at_monotonic)) ---
+_LABEL_CANON_CACHE: Dict[str, Tuple[str, float, float]] = {}
+_LABEL_CANON_CACHE_LOCK = asyncio.Lock()
+
+
+def _norm_label_key(label: str) -> str:
+    return " ".join(str(label or "").strip().lower().split())
+
+
+async def _call_ollama_text_json(
+    model: str,
+    prompt: str,
+    schema: Dict[str, Any],
+    timeout_sec: int,
+    temperature: float,
+) -> Any:
+    """
+    Вызов Ollama для текстовой задачи с guided decoding (format=schema).
+    Возвращает распарсенный JSON (dict/list).
+    """
+    async with _OLLAMA_SEM:
+        async with httpx.AsyncClient(timeout=timeout_sec) as client:
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "format": schema,
+                "options": {"temperature": temperature},
+            }
+            r = await client.post(OLLAMA_URL, json=payload)
+            r.raise_for_status()
+            data = r.json()
+            text = (data.get("response") or "").strip()
+            return _safe_json_parse(text)
+
+
+def _label_canon_schema() -> Dict[str, Any]:
+    # JSON-object: missing_qwen_label -> {synonym_label, confidence}
+    return {
+        "type": "object",
+        "additionalProperties": {
+            "type": "object",
+            "properties": {
+                "synonym_label": {"type": "string"},
+                "confidence": {"type": "number"},
+            },
+            "required": ["synonym_label", "confidence"],
+        },
+    }
+
+
+async def _find_yolo_synonyms(
+    missing_qwen_labels: List[str],
+    yolo_labels: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Для меток Qwen, которых нет в YOLO-ответе, ищет синонимы среди меток YOLO.
+    Возвращает mapping: missing_qwen_label -> {synonym_label, confidence}.
+    """
+    uniq_missing = [s for s in {str(x).strip() for x in (missing_qwen_labels or [])} if s]
+    uniq_yolo = [s for s in {str(x).strip() for x in (yolo_labels or [])} if s]
+    if not uniq_missing or not uniq_yolo:
+        return {}
+
+    now = time.monotonic()
+    ttl = max(1, int(LABEL_CANON_CACHE_TTL_SEC))
+    out: Dict[str, Dict[str, Any]] = {}
+    missing: List[str] = []
+    yolo_sig = "|".join(sorted({_norm_label_key(s) for s in uniq_yolo}))
+    async with _LABEL_CANON_CACHE_LOCK:
+        for raw in uniq_missing:
+            key = _norm_label_key(raw) + "||" + yolo_sig
+            cached = _LABEL_CANON_CACHE.get(key)
+            if cached and cached[2] > now:
+                out[raw] = {"synonym_label": cached[0], "confidence": cached[1]}
+            else:
+                missing.append(raw)
+
+    if missing:
+        raw_list = ", ".join(missing)
+        yolo_list = ", ".join(uniq_yolo)
+        prompt = (
+            "You map missing Qwen object labels to the closest synonym among labels that YOLO returned.\n"
+            "Return ONLY a JSON object mapping each missing Qwen label to an object:\n"
+            '{"synonym_label": "<one of YOLO labels or none>", "confidence": <0..1>}.\n'
+            "Rules:\n"
+            "- synonym_label MUST be either exactly one of the YOLO labels, or exactly 'none'.\n"
+            "- confidence is your certainty (0..1).\n"
+            "- If unsure, use synonym_label='none' with low confidence.\n\n"
+            f"YOLO labels: {yolo_list}\n"
+            f"Missing Qwen labels: {raw_list}\n"
+        )
+        try:
+            resp = await _call_ollama_text_json(
+                model=LABEL_CANON_MODEL,
+                prompt=prompt,
+                schema=_label_canon_schema(),
+                timeout_sec=int(LABEL_CANON_TIMEOUT_SEC),
+                temperature=float(LABEL_CANON_TEMPERATURE),
+            )
+        except Exception as e:
+            logger.warning("Label synonym search failed (fallback to none): %s", e)
+            resp = {}
+
+        # Нормализуем/валидируем ответ
+        yolo_set = set(uniq_yolo)
+        for raw in missing:
+            v = (resp or {}).get(raw) if isinstance(resp, dict) else None
+            if isinstance(v, dict):
+                c = str(v.get("synonym_label") or "").strip()
+                try:
+                    conf = float(v.get("confidence"))
+                except Exception:
+                    conf = 0.0
+                if c != "none" and c not in yolo_set:
+                    c, conf = "none", 0.0
+                out[raw] = {"synonym_label": c or "none", "confidence": conf}
+            else:
+                out[raw] = {"synonym_label": "none", "confidence": 0.0}
+
+        # Пишем в кеш
+        expires = now + ttl
+        async with _LABEL_CANON_CACHE_LOCK:
+            for raw, m in out.items():
+                key = _norm_label_key(raw) + "||" + yolo_sig
+                _LABEL_CANON_CACHE[key] = (str(m["synonym_label"]), float(m["confidence"]), expires)
+
+    return out
+
+
+def _apply_yolo_synonym_relabel(
+    yolo_detections: List[Dict[str, Any]],
+    synonyms: Dict[str, Dict[str, Any]],
+    min_confidence: float,
+) -> List[Dict[str, Any]]:
+    """
+    Переименовывает label у YOLO-детекций в Qwen-термины:
+    если для Qwen-label найден synonym_label среди YOLO-labels, то YOLO-detection с этим
+    synonym_label получит label=Qwen-label (при достаточной уверенности).
+    """
+    if not yolo_detections or not synonyms:
+        return []
+    # inverse mapping: yolo_label -> qwen_label (если уверенность достаточная)
+    inv: Dict[str, str] = {}
+    for qwen_label, m in (synonyms or {}).items():
+        syn = (m.get("synonym_label") or "").strip()
+        if not syn or syn == "none":
+            continue
+        try:
+            conf = float(m.get("confidence"))
+        except Exception:
+            conf = 0.0
+        if conf < float(min_confidence):
+            continue
+        # если несколько Qwen-label претендуют на один YOLO-label — оставляем более длинный (чуть стабильнее)
+        prev = inv.get(syn)
+        if prev is None or len(qwen_label) > len(prev):
+            inv[syn] = qwen_label
+
+    if not inv:
+        return list(yolo_detections)
+
+    out: List[Dict[str, Any]] = []
+    for d in yolo_detections:
+        label = (d.get("label") or "").strip()
+        q = inv.get(label)
+        if q:
+            nd = dict(d)
+            nd["label"] = q
+            out.append(nd)
+        else:
+            out.append(d)
+    return out
 
 # Redis: клиент создаётся при старте, закрывается при остановке
 _redis: Optional[Redis] = None
@@ -532,26 +711,24 @@ def _merge_v1_v2_detections(
     yolo_detections: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """
-    Объединяет детекции v1 (Qwen) и v2 (YOLO).
-    Для классов, присутствующих в v2, берём координаты из v2.
-    Классы, которые YOLO не распознал, добавляем из v1 с координатами Qwen.
+    Объединяет детекции v1 (Qwen) и v2 (YOLO) в зависимости от настройки.
+    Если MERGE_QWEN_YOLO_DETECTIONS = False — используем только детекции YOLO (если они есть).
+    Если MERGE_QWEN_YOLO_DETECTIONS = True — мерджим YOLO + добавки из Qwen по недостающим классам.
     """
-    # Новая логика: при наличии V2 используем только YOLO
-    #if yolo_detections:
-    #    return list(yolo_detections)
-    #return list(qwen_detections or [])
+    if not MERGE_QWEN_YOLO_DETECTIONS:
+        # Режим YOLO-only (если YOLO что-то вернул — берём только его детекции)
+        if yolo_detections:
+            return list(yolo_detections)
+        # Если YOLO пустой, возвращаем то, что было от Qwen (на всякий случай)
+        return list(qwen_detections or [])
 
-    # --- старая логика (мерж v1 + v2): закомментирована ---
-    # """
-    # """
+    # Режим мержа (YOLO + Qwen-добавки по недостающим классам)
     labels_in_v2 = {d.get("label", "").strip() for d in yolo_detections if d.get("label")}
-     # Сначала все детекции YOLO (приоритет координат v2)
     merged = list(yolo_detections)
-     # Добавляем из Qwen все объекты, чей класс не распознан YOLO (может быть несколько боксов на класс)
     for d in qwen_detections or []:
-         label = (d.get("label") or "").strip()
-         if label and label not in labels_in_v2:
-             merged.append(d)
+        label = (d.get("label") or "").strip()
+        if label and label not in labels_in_v2:
+            merged.append(d)
     return merged
 
 
@@ -592,9 +769,21 @@ async def _run_async_job(
             "detections": qwen_detections,
             "provider": PROVIDER_NAME,
         })
+
         class_names = class_names_override
         if not class_names and qwen_detections:
-            class_names = [d.get("label", "") for d in qwen_detections if d.get("label")]
+            # Канон динамический: классы берём из первых label, которые вернул Qwen для этого изображения.
+            seen = set()
+            class_names = []
+            for d in qwen_detections:
+                label = (d.get("label") or "").strip()
+                if not label:
+                    continue
+                k = _norm_label_key(label)
+                if k in seen:
+                    continue
+                seen.add(k)
+                class_names.append(label)
         if not class_names:
             class_names = list(YOLO_DEFAULT_CLASS_NAMES)
         logger.info("Async job %s: calling YOLO with class_names=%s", job_id, class_names)
@@ -604,8 +793,16 @@ async def _run_async_job(
             job_id,
             len(yolo_detections),
         )
-        # Финальный ответ v2: для классов из YOLO — координаты YOLO; остальные классы дополняем из v1 (Qwen)
-        detections = _merge_v1_v2_detections(qwen_detections, yolo_detections)
+        # Финальный ответ v2:
+        # - канон по label = исходные Qwen labels
+        # - если YOLO вернула другие labels, то для отсутствующих Qwen labels подбираем синоним
+        #   среди фактически возвращённых YOLO labels и переименовываем YOLO-детекции в Qwen-термины.
+        qwen_labels = {(d.get("label") or "").strip() for d in (qwen_detections or []) if d.get("label")}
+        yolo_labels = {(d.get("label") or "").strip() for d in (yolo_detections or []) if d.get("label")}
+        missing = sorted([l for l in qwen_labels if l and l not in yolo_labels])
+        synonyms = await _find_yolo_synonyms(missing, sorted(yolo_labels))
+        yolo_relabel = _apply_yolo_synonym_relabel(yolo_detections, synonyms, LABEL_CANON_MIN_CONFIDENCE)
+        detections = _merge_v1_v2_detections(qwen_detections, yolo_relabel)
         result = {
             "status": "done",
             "version": "v2",

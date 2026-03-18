@@ -8,8 +8,8 @@ from typing import Any, Dict, List
 
 # Ollama API
 OLLAMA_URL = "http://ollama:11434/api/generate"  # в docker-compose это имя сервиса
-# MODEL = os.environ.get("OLLAMA_MODEL", "qwen3-vl:8b-instruct-q8_0") # qwen2.5vl:7b-q8_0
-MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5vl:7b-q8_0")
+MODEL = os.environ.get("OLLAMA_MODEL", "qwen3-vl:8b-instruct-q8_0") # qwen2.5vl:7b-q8_0
+# MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5vl:7b-q8_0")
 
 # Ограничьте параллельные запросы к GPU (иначе очередь внутри Ollama и рост latency)
 OLLAMA_CONCURRENCY = 1
@@ -81,3 +81,15 @@ MERGE_QWEN_YOLO_DETECTIONS = os.environ.get(
     "MERGE_QWEN_YOLO_DETECTIONS",
     "true",
 ).lower() in ("1", "true", "yes")
+
+
+# --- Синонимы label (для согласования Qwen ↔ YOLO) ---
+# Канон задаётся динамически: набор меток, которые Qwen вернула первой детекцией на конкретном изображении.
+# Если YOLO вернула другой label, то для отсутствующих Qwen-меток подбираем синоним среди label, которые YOLO реально вернула.
+
+# Модель для поиска синонимов (текстовая). По умолчанию используем ту же, что и для vision.
+LABEL_CANON_MODEL = os.environ.get("LABEL_CANON_MODEL", "kimi-k2.5:cloud")
+LABEL_CANON_TIMEOUT_SEC = int(os.environ.get("LABEL_CANON_TIMEOUT_SEC", "30"))
+LABEL_CANON_TEMPERATURE = float(os.environ.get("LABEL_CANON_TEMPERATURE", "0.0"))
+LABEL_CANON_MIN_CONFIDENCE = float(os.environ.get("LABEL_CANON_MIN_CONFIDENCE", "0.6"))
+LABEL_CANON_CACHE_TTL_SEC = int(os.environ.get("LABEL_CANON_CACHE_TTL_SEC", "86400"))
