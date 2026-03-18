@@ -55,12 +55,28 @@ def _safe_schema(v: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _render_template(text: str, args: Optional[Dict[str, Any]]) -> str:
+    """
+    Простая подстановка {{var}} -> value для случаев, когда Langfuse prompt.compile()
+    не поддерживает аргументы в используемой версии SDK.
+    """
+    if not args or not text:
+        return text
+    out = text
+    for k, v in args.items():
+        out = out.replace("{{" + str(k) + "}}", str(v))
+    return out
+
+
 def model_to_prompt_name(model: str) -> str:
     """
     Маппинг модели Ollama → имя промпта в Langfuse.
     Можно расширять без изменения вызывающего кода.
     """
     m = (model or "").lower()
+    # kimi (cloud)
+    if "kimi-k2.5:cloud" in m or "kimi-k2.5-cloud" in m or ("kimi-k2.5" in m and "cloud" in m):
+        return "hereyouare.detect.kimi_k2_5_cloud"
     if "qwen3vl" in m or "qwen3-vl" in m or "qwen3_vl" in m:
         return "hereyouare.detect.qwen3vl"
     if "qwen2.5vl" in m or "qwen2_5vl" in m or "qwen2.5-vl" in m:
@@ -83,6 +99,7 @@ def get_prompt_bundle(
     fallback_schema: Dict[str, Any],
     fallback_temperature: float,
     ttl_sec: float = _DEFAULT_TTL_SEC,
+    compile_args: Optional[Dict[str, Any]] = None,
 ) -> PromptBundle:
     """
     Возвращает промпт+конфиг для Ollama, в приоритете Langfuse Prompt Management.
@@ -90,6 +107,13 @@ def get_prompt_bundle(
     """
     prompt_name = model_to_prompt_name(model)
     label = os.environ.get("LANGFUSE_PROMPT_LABEL", "production")
+    logger.warning(
+        "Langfuse get_prompt_bundle: model=%s prompt_name=%s label=%s enabled=%s",
+        model,
+        prompt_name,
+        label,
+        _is_enabled(),
+    )
 
     if not _is_enabled():
         return PromptBundle(
@@ -105,16 +129,38 @@ def get_prompt_bundle(
     now = time.time()
     cached = _CACHE.get(key)
     if cached and cached[0] > now:
-        return cached[1]
+        bundle = cached[1]
+        logger.warning(
+            "Langfuse get_prompt_bundle: cache hit source=%s prompt_name=%s label=%s",
+            bundle.source,
+            prompt_name,
+            label,
+        )
+        if compile_args and bundle.source == "langfuse":
+            return PromptBundle(
+                text=_render_template(bundle.text, compile_args),
+                format_schema=bundle.format_schema,
+                temperature=bundle.temperature,
+                parser_mode=bundle.parser_mode,
+                langfuse_prompt=bundle.langfuse_prompt,
+                source=bundle.source,
+            )
+        return bundle
 
     try:
         lf = _get_langfuse_client()
         lf_prompt = lf.get_prompt(prompt_name, label=label)
         # текст промпта
         try:
-            compiled = lf_prompt.compile()
+            if compile_args:
+                try:
+                    compiled = lf_prompt.compile(compile_args)
+                except TypeError:
+                    compiled = lf_prompt.compile()
+            else:
+                compiled = lf_prompt.compile()
         except TypeError:
-            # на случай, если compile требует args; берём базовый шаблон
+            # на случай, если compile требует args-объект; берём базовый шаблон
             compiled = lf_prompt.compile({})
 
         config = getattr(lf_prompt, "config", None) or {}
@@ -125,13 +171,20 @@ def get_prompt_bundle(
         schema = _safe_schema(config.get("ollama.format_schema") or config.get("format_schema"))
         parser_mode = config.get("parser.mode") if isinstance(config.get("parser.mode"), str) else None
 
+        compiled_text = _render_template(str(compiled), compile_args)
         bundle = PromptBundle(
-            text=str(compiled),
+            text=compiled_text,
             format_schema=schema or fallback_schema,
             temperature=temperature if temperature is not None else fallback_temperature,
             parser_mode=parser_mode,
             langfuse_prompt=lf_prompt,
             source="langfuse",
+        )
+        logger.warning(
+            "Langfuse get_prompt_bundle: fetched source=%s prompt_name=%s label=%s",
+            bundle.source,
+            prompt_name,
+            label,
         )
         _CACHE[key] = (now + float(ttl_sec), bundle)
         return bundle

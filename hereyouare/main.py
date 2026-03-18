@@ -74,25 +74,77 @@ async def _call_ollama_text_json(
     schema: Dict[str, Any],
     timeout_sec: int,
     temperature: float,
+    *,
+    langfuse_prompt: Any | None = None,
+    prompt_source: str | None = None,
 ) -> Any:
     """
     Вызов Ollama для текстовой задачи с guided decoding (format=schema).
     Возвращает распарсенный JSON (dict/list).
     """
-    async with _OLLAMA_SEM:
-        async with httpx.AsyncClient(timeout=timeout_sec) as client:
-            payload = {
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-                "format": schema,
-                "options": {"temperature": temperature},
-            }
-            r = await client.post(OLLAMA_URL, json=payload)
-            r.raise_for_status()
-            data = r.json()
-            text = (data.get("response") or "").strip()
-            return _safe_json_parse(text)
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "format": schema,
+        "options": {"temperature": temperature},
+    }
+
+    # Langfuse tracing (best-effort, no hard dependency), аналогично _run_detection
+    try:
+        from langfuse import get_client  # type: ignore
+
+        lf = get_client()
+    except Exception:
+        lf = None
+
+    if lf is None:
+        async with _OLLAMA_SEM:
+            async with httpx.AsyncClient(timeout=timeout_sec) as client:
+                r = await client.post(OLLAMA_URL, json=payload)
+    else:
+        try:
+            with lf.start_as_current_observation(
+                as_type="span",
+                name="hereyouare.label_synonyms",
+                input={
+                    "model": model,
+                    "prompt_source": prompt_source,
+                    "prompt_chars": len(prompt or ""),
+                    "ollama_url": OLLAMA_URL,
+                },
+            ):
+                with lf.start_as_current_observation(
+                    as_type="generation",
+                    name="ollama.generate",
+                    model=model,
+                    prompt=langfuse_prompt,
+                    input={
+                        "options": payload.get("options"),
+                        "format": payload.get("format"),
+                    },
+                ) as generation:
+                    async with _OLLAMA_SEM:
+                        async with httpx.AsyncClient(timeout=timeout_sec) as client:
+                            r = await client.post(OLLAMA_URL, json=payload)
+                    if getattr(r, "status_code", 0) == 200:
+                        try:
+                            body = r.json()
+                            generation.update(output={"raw": body.get("response", "")})
+                        except Exception:
+                            pass
+        finally:
+            # В фоновых async-задачах события Langfuse иногда остаются в буфере.
+            # flush() — best-effort, чтобы generation точно ушёл в Langfuse.
+            try:
+                lf.flush()
+            except Exception:
+                pass
+
+    r.raise_for_status()
+    data = r.json()
+    text = (data.get("response") or "").strip()
+    return _safe_json_parse(text)
 
 
 def _label_canon_schema() -> Dict[str, Any]:
@@ -121,6 +173,11 @@ async def _find_yolo_synonyms(
     uniq_missing = [s for s in {str(x).strip() for x in (missing_qwen_labels or [])} if s]
     uniq_yolo = [s for s in {str(x).strip() for x in (yolo_labels or [])} if s]
     if not uniq_missing or not uniq_yolo:
+        logger.warning(
+            "Label synonyms skipped: missing=%d yolo=%d (need both non-empty)",
+            len(uniq_missing),
+            len(uniq_yolo),
+        )
         return {}
 
     now = time.monotonic()
@@ -151,13 +208,32 @@ async def _find_yolo_synonyms(
             f"YOLO labels: {yolo_list}\n"
             f"Missing Qwen labels: {raw_list}\n"
         )
+        bundle = get_prompt_bundle(
+            model=LABEL_CANON_MODEL,
+            fallback_prompt=prompt,
+            fallback_schema=_label_canon_schema(),
+            fallback_temperature=float(LABEL_CANON_TEMPERATURE),
+            compile_args={
+                "yolo_labels": yolo_list,
+                "missing_qwen_labels": raw_list,
+            },
+        )
+        logger.warning(
+            "Label synonyms: calling model=%s prompt_source=%s yolo=%d missing=%d",
+            LABEL_CANON_MODEL,
+            bundle.source,
+            len(uniq_yolo),
+            len(missing),
+        )
         try:
             resp = await _call_ollama_text_json(
                 model=LABEL_CANON_MODEL,
-                prompt=prompt,
-                schema=_label_canon_schema(),
+                prompt=bundle.text,
+                schema=bundle.format_schema or _label_canon_schema(),
                 timeout_sec=int(LABEL_CANON_TIMEOUT_SEC),
-                temperature=float(LABEL_CANON_TEMPERATURE),
+                temperature=float(bundle.temperature if bundle.temperature is not None else LABEL_CANON_TEMPERATURE),
+                langfuse_prompt=bundle.langfuse_prompt,
+                prompt_source=bundle.source,
             )
         except Exception as e:
             logger.warning("Label synonym search failed (fallback to none): %s", e)
@@ -800,6 +876,13 @@ async def _run_async_job(
         qwen_labels = {(d.get("label") or "").strip() for d in (qwen_detections or []) if d.get("label")}
         yolo_labels = {(d.get("label") or "").strip() for d in (yolo_detections or []) if d.get("label")}
         missing = sorted([l for l in qwen_labels if l and l not in yolo_labels])
+        logger.warning(
+            "Async job %s: label sets qwen=%d yolo=%d missing=%d",
+            job_id,
+            len(qwen_labels),
+            len(yolo_labels),
+            len(missing),
+        )
         synonyms = await _find_yolo_synonyms(missing, sorted(yolo_labels))
         yolo_relabel = _apply_yolo_synonym_relabel(yolo_detections, synonyms, LABEL_CANON_MIN_CONFIDENCE)
         detections = _merge_v1_v2_detections(qwen_detections, yolo_relabel)
