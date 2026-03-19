@@ -349,7 +349,8 @@ services:
   #  restart: unless-stopped
 
 volumes:
-  ollama: {}
+  ollama:
+    external: true
   open-webui: {}
   redis-data: {}
   langfuse_postgres_data: {}
