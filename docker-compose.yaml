@@ -255,7 +255,33 @@ services:
       - ollama
       - time-ui
       - picture-ui
+      - mcp-tasks
     pull_policy: if_not_present
+    restart: unless-stopped
+
+  mcp-tasks:
+    build:
+      context: ./mcp-tasks
+      dockerfile: Dockerfile
+    container_name: mcp-tasks
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      TZ: ${TZ:-Asia/Almaty}
+      SQLITE_PATH: /data/tasks.db
+      MCP_TRANSPORT: http
+      MCP_HTTP_HOST: 0.0.0.0
+      MCP_HTTP_PORT: "8084"
+      # Open WebUI (Streamable HTTP) после initialize часто делает GET /mcp (SSE); при STATELESS=true
+      # на /mcp только POST/DELETE — клиент получает 405. См. docs.openwebui.com MCP + GitHub #14776.
+      FASTMCP_JSON_RESPONSE: "false"
+      FASTMCP_STATELESS_HTTP: "false"
+    volumes:
+      - mcp-tasks-data:/data
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    ports:
+      - "8084:8084"
     restart: unless-stopped
 
   time-ui:
@@ -351,6 +377,7 @@ services:
 volumes:
   ollama:
     external: true
+  mcp-tasks-data: {}
   open-webui: {}
   redis-data: {}
   langfuse_postgres_data: {}
