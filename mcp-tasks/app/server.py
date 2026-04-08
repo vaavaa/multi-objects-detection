@@ -1,12 +1,29 @@
 from __future__ import annotations
 
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from app.config import settings
 from app.models import AssigneeKey, TaskStatus
 from app.store import TaskStore
 
 mcp = FastMCP(settings.server_name)
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def http_health(_request: Request) -> JSONResponse:
+    """Plain HTTP check (curl / load balancers). MCP endpoint remains POST /mcp."""
+    return JSONResponse(
+        {
+            "status": "ok",
+            "service": settings.server_name,
+            "mcp_url_path": "/mcp",
+            "sqlite_path": settings.sqlite_path,
+            "note": "Open WebUI: MCP server URL is http://<host>:<port>/mcp (streamable HTTP).",
+        }
+    )
+
 
 _store: TaskStore | None = None
 
@@ -29,7 +46,7 @@ def task_health() -> dict:
 
 
 @mcp.tool()
-def create_task(
+def create_handoff_task(
     chat_id: str,
     body: str,
     assignee: AssigneeKey,

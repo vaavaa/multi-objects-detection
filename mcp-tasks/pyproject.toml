@@ -17,6 +17,9 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+  "e2e: curl-пробы к поднятому mcp-tasks по HTTP (нужен MCP_TASKS_E2E_URL)",
+]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
