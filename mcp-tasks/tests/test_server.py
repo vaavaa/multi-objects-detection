@@ -15,6 +15,30 @@ def srv(monkeypatch, tmp_path):
     return server_module, isolated
 
 
+def test_info_agent_answer_tool(srv, monkeypatch):
+    monkeypatch.setenv("INFO_AGENT_MOCK", "1")
+    import app.config as cfg
+
+    # сброс кэша настроек не нужен: mock читается через os.environ на каждый вызов
+    server_module, _ = srv
+    out = server_module.info_agent_answer("Тестовый вопрос", chat_id="c1")
+    assert "MOCK" in out["answer"]
+    assert out["model"] == cfg.settings.ollama_model
+
+
+def test_get_task_tool(srv):
+    server_module, _ = srv
+    out = server_module.create_handoff_task(chat_id="c", body="детали")
+    full = server_module.get_task(out["id"])
+    assert full["found"] is True
+    assert full["type"] == "task"
+    assert full["body"] == "детали"
+    assert "what_this_record_means" in full
+    assert "field_reference" in full
+    miss = server_module.get_task("00000000-0000-0000-0000-000000000001")
+    assert miss["found"] is False
+
+
 def test_task_health(srv):
     server_module, _ = srv
     h = server_module.task_health()
@@ -23,28 +47,27 @@ def test_task_health(srv):
     assert h["sqlite_path"] == server_module.settings.sqlite_path
 
 
-def test_create_task_tool(srv):
+def test_create_handoff_task_tool(srv):
     server_module, _ = srv
-    out = server_module.create_task(
+    out = server_module.create_handoff_task(
         chat_id="chat-1",
         body="Сделать отчёт",
-        assignee="oksana",
         user_id="user-42",
         status="pending",
     )
     assert out["body"] == "Сделать отчёт"
     assert out["chat_id"] == "chat-1"
     assert out["user_id"] == "user-42"
-    assert out["assignee"] == "oksana"
-    assert out["assignee_name"] == "Оксана"
+    assert out["assignee"] in ("serik", "evgeniya", "oksana")
+    assert out["assignee_name"] in ("Серик", "Евгения", "Оксана")
     assert out["status"] == "pending"
     assert out["task_number"] == 1
 
 
 def test_list_tasks_tool(srv):
     server_module, store = srv
-    server_module.create_task(chat_id="c", body="t1", assignee="serik")
-    server_module.create_task(chat_id="c", body="t2", assignee="evgeniya", user_id="u1")
+    server_module.create_handoff_task(chat_id="c", body="t1")
+    server_module.create_handoff_task(chat_id="c", body="t2", user_id="u1")
     wrapped = server_module.list_tasks(chat_id="c")
     assert wrapped["chat_id"] == "c"
     assert wrapped["user_id"] is None

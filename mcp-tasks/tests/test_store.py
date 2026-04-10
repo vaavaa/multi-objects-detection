@@ -5,7 +5,42 @@ import uuid
 
 import pytest
 
+import sqlite3
+
 from app.store import TaskStore
+
+
+def test_migration_adds_type_column_on_legacy_db(tmp_path):
+    """БД до появления поля type — при открытии TaskStore колонка добавляется."""
+    path = str(tmp_path / "legacy.sqlite")
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE tasks (
+          task_number INTEGER PRIMARY KEY AUTOINCREMENT,
+          id TEXT NOT NULL UNIQUE,
+          chat_id TEXT NOT NULL,
+          user_id TEXT,
+          body TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          assignee TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = TaskStore(path)
+    t = store.create_task(
+        chat_id="c",
+        body="x",
+        assignee="oksana",
+        user_id=None,
+        status="pending",
+    )
+    assert t["type"] == "task"
 
 
 def test_create_returns_global_task_numbers_and_uuid(store):
@@ -89,6 +124,28 @@ def test_timestamps_iso_utc_like(store):
     )
     assert re.match(r"^\d{4}-\d{2}-\d{2}T", t["created_at"])
     assert t["created_at"] == t["updated_at"]
+
+
+def test_get_record_by_id_task_and_info_request(store):
+    t = store.create_task(
+        chat_id="c",
+        body="handoff",
+        assignee="oksana",
+        user_id="u1",
+        status="pending",
+    )
+    i = store.create_info_request(
+        chat_id="c",
+        body="info?",
+        assignee="serik",
+        user_id=None,
+        status="pending",
+    )
+    gt = store.get_record_by_id(t["id"])
+    gi = store.get_record_by_id(i["id"])
+    assert gt is not None and gt["type"] == "task"
+    assert gi is not None and gi["type"] == "info_request"
+    assert store.get_record_by_id("00000000-0000-0000-0000-000000000000") is None
 
 
 def test_second_store_same_file_sees_data(store, db_path):

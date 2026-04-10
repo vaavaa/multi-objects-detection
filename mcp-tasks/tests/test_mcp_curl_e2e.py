@@ -220,15 +220,21 @@ def test_mcp_initialize_and_tools_list(curl_exe, base_url, tmp_path):
     )
     assert st == 200, msg
     names = {t["name"] for t in msg.get("result", {}).get("tools", [])}
-    assert {"task_health", "create_task", "list_tasks"}.issubset(names)
+    assert {
+        "task_health",
+        "list_tasks",
+        "get_task",
+        "info_agent_answer",
+        "create_handoff_task",
+        "create_info_request",
+    }.issubset(names)
     for tool in msg["result"]["tools"]:
-        if tool["name"] == "create_task":
+        if tool["name"] == "create_handoff_task":
             props = tool["inputSchema"].get("properties", {})
-            assert "chat_id" in props and "assignee" in props
-            assert "enum" in props["assignee"]
+            assert "chat_id" in props and "body" in props
             break
     else:
-        pytest.fail("create_task tool not in list")
+        pytest.fail("create_handoff_task tool not in list")
 
 
 @pytest.mark.e2e
