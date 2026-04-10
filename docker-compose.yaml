@@ -276,12 +276,16 @@ services:
       # на /mcp только POST/DELETE — клиент получает 405. См. docs.openwebui.com MCP + GitHub #14776.
       FASTMCP_JSON_RESPONSE: "false"
       FASTMCP_STATELESS_HTTP: "false"
+      OLLAMA_BASE_URL: ${MCP_TASKS_OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-glm-5:cloud}
     volumes:
       - mcp-tasks-data:/data
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     ports:
       - "8084:8084"
+    depends_on:
+      ollama: { condition: service_started }
     restart: unless-stopped
 
   time-ui:
